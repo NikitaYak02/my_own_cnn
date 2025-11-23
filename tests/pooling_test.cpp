@@ -59,3 +59,31 @@ TEST(PoolingTest, GroupedChannels) {
     EXPECT_FLOAT_EQ(grad_in(0, 0, 0, 1), 1.0f);
 }
 
+TEST(PoolingTest, CpuCudaParity) {
+    Tensor input({1, 2, 2, 2});
+    input(0, 0, 0, 0) = 1.0f;
+    input(0, 0, 1, 0) = 3.0f;
+    input(0, 1, 0, 0) = 5.0f;
+    input(0, 1, 1, 0) = 7.0f;
+    input(0, 0, 0, 1) = -1.0f;
+    input(0, 0, 1, 1) = -3.0f;
+    input(0, 1, 0, 1) = -5.0f;
+    input(0, 1, 1, 1) = -7.0f;
+
+    PoolingParams params{2, 2, 1, 1, 0, 0, 2};
+    Tensor cpu_out = pooling_forward_cpu(input, PoolingType::Max, params);
+    Tensor cuda_out = pooling_forward_cuda(input, PoolingType::Max, params);
+    for (int c = 0; c < cpu_out.shape().c; ++c) {
+        EXPECT_NEAR(cpu_out(0, 0, 0, c), cuda_out(0, 0, 0, c), 1e-6);
+    }
+
+    Tensor grad_out({1, 1, 1, 2});
+    grad_out(0, 0, 0, 0) = 0.5f;
+    grad_out(0, 0, 0, 1) = -0.5f;
+    Tensor cpu_grad = pooling_backward_cpu(input, grad_out, PoolingType::Max, params);
+    Tensor cuda_grad = pooling_backward_cuda(input, grad_out, PoolingType::Max, params);
+    for (int idx = 0; idx < cpu_grad.num_elements(); ++idx) {
+        EXPECT_NEAR(cpu_grad.data()[idx], cuda_grad.data()[idx], 1e-6);
+    }
+}
+

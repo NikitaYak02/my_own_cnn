@@ -22,13 +22,11 @@ Tensor batchnorm_backward_cpu(const Tensor &grad_output, const Tensor &input, co
                                const BatchNormCache &cache, std::vector<float> &grad_gamma, std::vector<float> &grad_beta,
                                const BatchNormParams &params);
 
-#ifdef __CUDACC__
 Tensor batchnorm_forward_cuda(const Tensor &input, const std::vector<float> &gamma, const std::vector<float> &beta,
                               BatchNormCache &cache, const BatchNormParams &params);
 
 Tensor batchnorm_backward_cuda(const Tensor &grad_output, const Tensor &input, const std::vector<float> &gamma,
                                const BatchNormCache &cache, std::vector<float> &grad_gamma, std::vector<float> &grad_beta,
                                const BatchNormParams &params);
-#endif
 
 } // namespace mycnn

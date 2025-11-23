@@ -41,3 +41,39 @@ TEST(BatchNormTest, BackwardComputesGradients) {
     EXPECT_NEAR(grad_in(0, 0, 0, 0), 1.0f * gamma[0] / std::sqrt(cache.variance[0] + params.epsilon), 1e-5);
 }
 
+TEST(BatchNormTest, CpuCudaParity) {
+    Tensor input({2, 1, 1, 2});
+    input(0, 0, 0, 0) = 1.0f;
+    input(0, 0, 0, 1) = 2.0f;
+    input(1, 0, 0, 0) = 3.0f;
+    input(1, 0, 0, 1) = 4.0f;
+
+    std::vector<float> gamma{0.5f, 1.5f};
+    std::vector<float> beta{0.1f, -0.2f};
+    BatchNormParams params;
+    BatchNormCache cpu_cache;
+    BatchNormCache cuda_cache;
+    Tensor cpu_out = batchnorm_forward_cpu(input, gamma, beta, cpu_cache, params);
+    Tensor cuda_out = batchnorm_forward_cuda(input, gamma, beta, cuda_cache, params);
+    for (int idx = 0; idx < cpu_out.num_elements(); ++idx) {
+        EXPECT_NEAR(cpu_out.data()[idx], cuda_out.data()[idx], 1e-6);
+    }
+
+    Tensor grad_out({2, 1, 1, 2});
+    grad_out(0, 0, 0, 0) = 0.4f;
+    grad_out(0, 0, 0, 1) = -0.6f;
+    grad_out(1, 0, 0, 0) = 0.8f;
+    grad_out(1, 0, 0, 1) = -1.0f;
+    std::vector<float> cpu_grad_gamma, cpu_grad_beta;
+    std::vector<float> cuda_grad_gamma, cuda_grad_beta;
+    Tensor cpu_grad = batchnorm_backward_cpu(grad_out, input, gamma, cpu_cache, cpu_grad_gamma, cpu_grad_beta, params);
+    Tensor cuda_grad = batchnorm_backward_cuda(grad_out, input, gamma, cuda_cache, cuda_grad_gamma, cuda_grad_beta, params);
+    for (int idx = 0; idx < cpu_grad.num_elements(); ++idx) {
+        EXPECT_NEAR(cpu_grad.data()[idx], cuda_grad.data()[idx], 1e-5);
+    }
+    for (size_t idx = 0; idx < cpu_grad_gamma.size(); ++idx) {
+        EXPECT_NEAR(cpu_grad_gamma[idx], cuda_grad_gamma[idx], 1e-5);
+        EXPECT_NEAR(cpu_grad_beta[idx], cuda_grad_beta[idx], 1e-5);
+    }
+}
+

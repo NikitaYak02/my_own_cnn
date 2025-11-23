@@ -20,9 +20,7 @@ struct PoolingParams {
 Tensor pooling_forward_cpu(const Tensor &input, PoolingType type, const PoolingParams &params);
 Tensor pooling_backward_cpu(const Tensor &input, const Tensor &output_grad, PoolingType type, const PoolingParams &params);
 
-#ifdef __CUDACC__
 Tensor pooling_forward_cuda(const Tensor &input, PoolingType type, const PoolingParams &params);
 Tensor pooling_backward_cuda(const Tensor &input, const Tensor &output_grad, PoolingType type, const PoolingParams &params);
-#endif
 
 } // namespace mycnn

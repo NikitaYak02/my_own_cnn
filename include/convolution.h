@@ -20,12 +20,10 @@ Tensor conv2d_forward_cpu(const Tensor &input, const Tensor &weights, const std:
 Tensor conv2d_backward_input_cpu(const Tensor &grad_output, const Tensor &weights, const Conv2DParams &params, Shape input_shape);
 Tensor conv2d_backward_weights_cpu(const Tensor &grad_output, const Tensor &input, const Conv2DParams &params, Shape weight_shape);
 
-#ifdef __CUDACC__
 Tensor conv2d_forward_cuda(const Tensor &input, const Tensor &weights, const std::vector<float> &bias,
                            const Conv2DParams &params);
 Tensor conv2d_backward_input_cuda(const Tensor &grad_output, const Tensor &weights, const Conv2DParams &params, Shape input_shape);
 Tensor conv2d_backward_weights_cuda(const Tensor &grad_output, const Tensor &input, const Conv2DParams &params, Shape weight_shape);
-#endif
 
 Tensor conv2d_forward_cudnn(const Tensor &input, const Tensor &weights, const std::vector<float> &bias,
                             const Conv2DParams &params);

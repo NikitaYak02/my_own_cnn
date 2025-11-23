@@ -67,3 +67,37 @@ TEST(ConvolutionTest, GroupedForward) {
     EXPECT_FLOAT_EQ(output(0, 0, 1, 1), 8.0f);
 }
 
+TEST(ConvolutionTest, CpuCudaParity) {
+    Tensor input({1, 2, 2, 2});
+    input(0, 0, 0, 0) = 1.0f;
+    input(0, 0, 1, 0) = 2.0f;
+    input(0, 1, 0, 0) = 3.0f;
+    input(0, 1, 1, 0) = 4.0f;
+    input(0, 0, 0, 1) = -1.0f;
+    input(0, 0, 1, 1) = -2.0f;
+    input(0, 1, 0, 1) = -3.0f;
+    input(0, 1, 1, 1) = -4.0f;
+
+    Tensor weights({2, 2, 2, 1});
+    for (int i = 0; i < weights.num_elements(); ++i) {
+        weights.data()[i] = (i % 2 == 0) ? 1.0f : -1.0f;
+    }
+    std::vector<float> bias{0.5f, -0.5f};
+    Conv2DParams params{2, 2, 1, 1, 0, 0, 1};
+
+    Tensor cpu_out = conv2d_forward_cpu(input, weights, bias, params);
+    Tensor cuda_out = conv2d_forward_cuda(input, weights, bias, params);
+    for (int c = 0; c < cpu_out.shape().c; ++c) {
+        EXPECT_NEAR(cpu_out(0, 0, 0, c), cuda_out(0, 0, 0, c), 1e-5);
+    }
+
+    Tensor grad_out({1, 1, 1, 2});
+    grad_out(0, 0, 0, 0) = 1.0f;
+    grad_out(0, 0, 0, 1) = -1.0f;
+    Tensor cpu_grad_in = conv2d_backward_input_cpu(grad_out, weights, params, input.shape());
+    Tensor cuda_grad_in = conv2d_backward_input_cuda(grad_out, weights, params, input.shape());
+    for (int idx = 0; idx < cpu_grad_in.num_elements(); ++idx) {
+        EXPECT_NEAR(cpu_grad_in.data()[idx], cuda_grad_in.data()[idx], 1e-5);
+    }
+}
+
