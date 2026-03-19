@@ -1,6 +1,7 @@
 #include "conv_types.h"
 #include "cuda_utils.h"
 
+#include <iostream>
 #include <stdexcept>
 #include <vector>
 
@@ -76,30 +77,55 @@ BenchResult run_bench(size_t flops, int warmup, int iters, Fn&& fn) {
   return benchmark_cuda_op("cudnn", warmup, iters, flops, fn);
 }
 
-void hwio_to_krsc_host(const std::vector<float>& hwio, std::vector<float>& krsc, int r, int s, int cin_group, int k_total) {
+const char* fwd_algo_to_string(cudnnConvolutionFwdAlgo_t algo) {
+  switch (algo) {
+    case CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM: return "CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM";
+    case CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM: return "CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM";
+    case CUDNN_CONVOLUTION_FWD_ALGO_GEMM: return "CUDNN_CONVOLUTION_FWD_ALGO_GEMM";
+    case CUDNN_CONVOLUTION_FWD_ALGO_DIRECT: return "CUDNN_CONVOLUTION_FWD_ALGO_DIRECT";
+    case CUDNN_CONVOLUTION_FWD_ALGO_FFT: return "CUDNN_CONVOLUTION_FWD_ALGO_FFT";
+    case CUDNN_CONVOLUTION_FWD_ALGO_FFT_TILING: return "CUDNN_CONVOLUTION_FWD_ALGO_FFT_TILING";
+    case CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD: return "CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD";
+    case CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED: return "CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED";
+    case CUDNN_CONVOLUTION_FWD_ALGO_COUNT: return "CUDNN_CONVOLUTION_FWD_ALGO_COUNT";
+    default: return "CUDNN_CONVOLUTION_FWD_ALGO_UNKNOWN";
+  }
+}
+
+const char* math_type_to_string(cudnnMathType_t math_type) {
+  switch (math_type) {
+    case CUDNN_DEFAULT_MATH: return "CUDNN_DEFAULT_MATH";
+    case CUDNN_TENSOR_OP_MATH: return "CUDNN_TENSOR_OP_MATH";
+    case CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION: return "CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION";
+    case CUDNN_FMA_MATH: return "CUDNN_FMA_MATH";
+    default: return "CUDNN_MATH_UNKNOWN";
+  }
+}
+
+void hwcn_to_krsc_host(const std::vector<float>& hwcn, std::vector<float>& krsc, int r, int s, int cin_group, int k_total) {
   krsc.resize(static_cast<size_t>(k_total) * r * s * cin_group);
   for (int kk = 0; kk < k_total; ++kk) {
     for (int rr = 0; rr < r; ++rr) {
       for (int ss = 0; ss < s; ++ss) {
         for (int ci = 0; ci < cin_group; ++ci) {
-          const size_t src = idx_hwio(rr, ss, ci, kk, s, cin_group, k_total);
+          const size_t src = idx_hwcn(rr, ss, ci, kk, s, cin_group, k_total);
           const size_t dst = ((static_cast<size_t>(kk) * r + rr) * s + ss) * cin_group + ci;
-          krsc[dst] = hwio[src];
+          krsc[dst] = hwcn[src];
         }
       }
     }
   }
 }
 
-void krsc_to_hwio_host(const std::vector<float>& krsc, std::vector<float>& hwio, int r, int s, int cin_group, int k_total) {
-  hwio.resize(static_cast<size_t>(k_total) * r * s * cin_group);
+void krsc_to_hwcn_host(const std::vector<float>& krsc, std::vector<float>& hwcn, int r, int s, int cin_group, int k_total) {
+  hwcn.resize(static_cast<size_t>(k_total) * r * s * cin_group);
   for (int kk = 0; kk < k_total; ++kk) {
     for (int rr = 0; rr < r; ++rr) {
       for (int ss = 0; ss < s; ++ss) {
         for (int ci = 0; ci < cin_group; ++ci) {
           const size_t src = ((static_cast<size_t>(kk) * r + rr) * s + ss) * cin_group + ci;
-          const size_t dst = idx_hwio(rr, ss, ci, kk, s, cin_group, k_total);
-          hwio[dst] = krsc[src];
+          const size_t dst = idx_hwcn(rr, ss, ci, kk, s, cin_group, k_total);
+          hwcn[dst] = krsc[src];
         }
       }
     }
@@ -115,7 +141,7 @@ BenchResult cudnn_fprop_bench(const float* d_x, const float* d_w, float* d_y,
                               const Conv2DParams& p,
                               int warmup, int iters) {
   TensorNHWC xt(n, h, w, c);
-  FilterHWIO wt(r, s, c / p.groups, k);
+  FilterHWCN wt(r, s, c / p.groups, k);
   ConvShape sh = infer_conv_shape(xt, wt, p);
 
   CudnnHandle handle;
@@ -126,10 +152,10 @@ BenchResult cudnn_fprop_bench(const float* d_x, const float* d_w, float* d_y,
   const int total_w = k * r * s * cin_group;
   float* d_w_krsc = nullptr;
   CUDA_CHECK(cudaMalloc(&d_w_krsc, static_cast<size_t>(total_w) * sizeof(float)));
-  std::vector<float> h_w_hwio(static_cast<size_t>(total_w));
+  std::vector<float> h_w_hwcn(static_cast<size_t>(total_w));
   std::vector<float> h_w_krsc;
-  CUDA_CHECK(cudaMemcpy(h_w_hwio.data(), d_w, static_cast<size_t>(total_w) * sizeof(float), cudaMemcpyDeviceToHost));
-  hwio_to_krsc_host(h_w_hwio, h_w_krsc, r, s, cin_group, k);
+  CUDA_CHECK(cudaMemcpy(h_w_hwcn.data(), d_w, static_cast<size_t>(total_w) * sizeof(float), cudaMemcpyDeviceToHost));
+  hwcn_to_krsc_host(h_w_hwcn, h_w_krsc, r, s, cin_group, k);
   CUDA_CHECK(cudaMemcpy(d_w_krsc, h_w_krsc.data(), static_cast<size_t>(total_w) * sizeof(float), cudaMemcpyHostToDevice));
 
   int returned = 0;
@@ -138,6 +164,13 @@ BenchResult cudnn_fprop_bench(const float* d_x, const float* d_w, float* d_y,
   if (returned <= 0 || perf.status != CUDNN_STATUS_SUCCESS) {
     throw std::runtime_error("cuDNN failed to select forward algo");
   }
+  std::cout << "cudnn fprop algo=" << fwd_algo_to_string(perf.algo)
+            << " algo_id=" << static_cast<int>(perf.algo)
+            << " est_time_ms=" << perf.time
+            << " workspace_bytes=" << perf.memory
+            << " math_type=" << math_type_to_string(perf.mathType)
+            << " math_type_id=" << static_cast<int>(perf.mathType)
+            << "\n";
   cudnnConvolutionFwdAlgo_t algo = perf.algo;
 
   size_t ws_size = 0;
@@ -164,7 +197,7 @@ BenchResult cudnn_bprop_bench(const float* d_dy, const float* d_w, float* d_dx,
                               const Conv2DParams& p,
                               int warmup, int iters) {
   TensorNHWC xt(n, h, w, c);
-  FilterHWIO wt(r, s, c / p.groups, k);
+  FilterHWCN wt(r, s, c / p.groups, k);
   ConvShape sh = infer_conv_shape(xt, wt, p);
 
   CudnnHandle handle;
@@ -175,10 +208,10 @@ BenchResult cudnn_bprop_bench(const float* d_dy, const float* d_w, float* d_dx,
   const int total_w = k * r * s * cin_group;
   float* d_w_krsc = nullptr;
   CUDA_CHECK(cudaMalloc(&d_w_krsc, static_cast<size_t>(total_w) * sizeof(float)));
-  std::vector<float> h_w_hwio(static_cast<size_t>(total_w));
+  std::vector<float> h_w_hwcn(static_cast<size_t>(total_w));
   std::vector<float> h_w_krsc;
-  CUDA_CHECK(cudaMemcpy(h_w_hwio.data(), d_w, static_cast<size_t>(total_w) * sizeof(float), cudaMemcpyDeviceToHost));
-  hwio_to_krsc_host(h_w_hwio, h_w_krsc, r, s, cin_group, k);
+  CUDA_CHECK(cudaMemcpy(h_w_hwcn.data(), d_w, static_cast<size_t>(total_w) * sizeof(float), cudaMemcpyDeviceToHost));
+  hwcn_to_krsc_host(h_w_hwcn, h_w_krsc, r, s, cin_group, k);
   CUDA_CHECK(cudaMemcpy(d_w_krsc, h_w_krsc.data(), static_cast<size_t>(total_w) * sizeof(float), cudaMemcpyHostToDevice));
 
   int returned = 0;
@@ -213,7 +246,7 @@ BenchResult cudnn_grad_bench(const float* d_x, const float* d_dy, float* d_dw,
                              const Conv2DParams& p,
                              int warmup, int iters) {
   TensorNHWC xt(n, h, w, c);
-  FilterHWIO wt(r, s, c / p.groups, k);
+  FilterHWCN wt(r, s, c / p.groups, k);
   ConvShape sh = infer_conv_shape(xt, wt, p);
 
   CudnnHandle handle;
@@ -248,10 +281,10 @@ BenchResult cudnn_grad_bench(const float* d_x, const float* d_dy, float* d_dw,
   BenchResult out = run_bench(flops, warmup, iters, fn);
 
   std::vector<float> h_dw_krsc(static_cast<size_t>(total_w));
-  std::vector<float> h_dw_hwio;
+  std::vector<float> h_dw_hwcn;
   CUDA_CHECK(cudaMemcpy(h_dw_krsc.data(), d_dw_krsc, static_cast<size_t>(total_w) * sizeof(float), cudaMemcpyDeviceToHost));
-  krsc_to_hwio_host(h_dw_krsc, h_dw_hwio, r, s, cin_group, k);
-  CUDA_CHECK(cudaMemcpy(d_dw, h_dw_hwio.data(), static_cast<size_t>(total_w) * sizeof(float), cudaMemcpyHostToDevice));
+  krsc_to_hwcn_host(h_dw_krsc, h_dw_hwcn, r, s, cin_group, k);
+  CUDA_CHECK(cudaMemcpy(d_dw, h_dw_hwcn.data(), static_cast<size_t>(total_w) * sizeof(float), cudaMemcpyHostToDevice));
 
   if (ws) CUDA_CHECK(cudaFree(ws));
   CUDA_CHECK(cudaFree(d_dw_krsc));

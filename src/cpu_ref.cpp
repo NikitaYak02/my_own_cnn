@@ -2,7 +2,7 @@
 
 #include <algorithm>
 
-void cpu_fprop_nhwc(const TensorNHWC& x, const FilterHWIO& w, const Conv2DParams& p, TensorNHWC& y) {
+void cpu_fprop_nhwc(const TensorNHWC& x, const FilterHWCN& w, const Conv2DParams& p, TensorNHWC& y) {
   const ConvShape shape = infer_conv_shape(x, w, p);
   y = TensorNHWC(x.n, shape.ho, shape.wo, w.k);
   std::fill(y.data.begin(), y.data.end(), 0.0f);
@@ -23,7 +23,7 @@ void cpu_fprop_nhwc(const TensorNHWC& x, const FilterHWIO& w, const Conv2DParams
                 if (wi < 0 || wi >= x.w) continue;
                 for (int ci = 0; ci < shape.cin_group; ++ci) {
                   const float xv = x.data[idx_nhwc(n, hi, wi, cin_base + ci, x.h, x.w, x.c)];
-                  const float wv = w.data[idx_hwio(rr, ss, ci, kout_base + ko, w.s, w.cin_per_group, w.k)];
+                  const float wv = w.data[idx_hwcn(rr, ss, ci, kout_base + ko, w.s, w.cin_per_group, w.k)];
                   acc += xv * wv;
                 }
               }
@@ -36,7 +36,7 @@ void cpu_fprop_nhwc(const TensorNHWC& x, const FilterHWIO& w, const Conv2DParams
   }
 }
 
-void cpu_bprop_nhwc(const TensorNHWC& dy, const FilterHWIO& w, const Conv2DParams& p, TensorNHWC& dx) {
+void cpu_bprop_nhwc(const TensorNHWC& dy, const FilterHWCN& w, const Conv2DParams& p, TensorNHWC& dx) {
   if (p.groups <= 0 || dx.c % p.groups != 0 || w.k % p.groups != 0) {
     throw std::runtime_error("invalid group configuration for bprop");
   }
@@ -67,7 +67,7 @@ void cpu_bprop_nhwc(const TensorNHWC& dy, const FilterHWIO& w, const Conv2DParam
 
                 for (int ko = 0; ko < kout_group; ++ko) {
                   const float dyv = dy.data[idx_nhwc(n, ho, wo, kout_base + ko, dy.h, dy.w, dy.c)];
-                  const float wv = w.data[idx_hwio(rr, ss, ci, kout_base + ko, w.s, w.cin_per_group, w.k)];
+                  const float wv = w.data[idx_hwcn(rr, ss, ci, kout_base + ko, w.s, w.cin_per_group, w.k)];
                   acc += dyv * wv;
                 }
               }
@@ -80,7 +80,7 @@ void cpu_bprop_nhwc(const TensorNHWC& dy, const FilterHWIO& w, const Conv2DParam
   }
 }
 
-void cpu_grad_nhwc(const TensorNHWC& x, const TensorNHWC& dy, const Conv2DParams& p, FilterHWIO& dw) {
+void cpu_grad_nhwc(const TensorNHWC& x, const TensorNHWC& dy, const Conv2DParams& p, FilterHWCN& dw) {
   if (p.groups <= 0 || x.c % p.groups != 0 || dy.c % p.groups != 0) {
     throw std::runtime_error("invalid group configuration for grad");
   }
@@ -110,7 +110,7 @@ void cpu_grad_nhwc(const TensorNHWC& x, const TensorNHWC& dy, const Conv2DParams
                 }
               }
             }
-            dw.data[idx_hwio(rr, ss, ci, kout_base + ko, dw.s, dw.cin_per_group, dw.k)] = acc;
+            dw.data[idx_hwcn(rr, ss, ci, kout_base + ko, dw.s, dw.cin_per_group, dw.k)] = acc;
           }
         }
       }
