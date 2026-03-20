@@ -179,13 +179,13 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
   p.groups = bc.groups;
 
   TensorNHWC x(bc.n, bc.h, bc.w, bc.c);
-  FilterHWCN w(bc.r, bc.s, bc.c / bc.groups, bc.k);
+  FilterKRSC w(bc.r, bc.s, bc.c / bc.groups, bc.k);
   ConvShape sh = infer_conv_shape(x, w, p);
 
   TensorNHWC y(bc.n, sh.ho, sh.wo, bc.k);
   TensorNHWC dy(bc.n, sh.ho, sh.wo, bc.k);
   TensorNHWC dx(bc.n, bc.h, bc.w, bc.c);
-  FilterHWCN dw(bc.r, bc.s, bc.c / bc.groups, bc.k);
+  FilterKRSC dw(bc.r, bc.s, bc.c / bc.groups, bc.k);
 
   std::mt19937 gen(o.seed);
   fill_random(x.data, gen);
@@ -281,7 +281,7 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
                 << " max_abs=" << vr.max_abs_err << " max_rel=" << vr.max_rel_err << "\n";
     }
     if (do_grad) {
-      FilterHWCN dw_cpu(bc.r, bc.s, bc.c / bc.groups, bc.k);
+      FilterKRSC dw_cpu(bc.r, bc.s, bc.c / bc.groups, bc.k);
       cpu_grad_nhwc(x, dy, p, dw_cpu);
       CUDA_CHECK(cudaMemcpy(dw.ptr(), d_dw, dw.elements() * sizeof(float), cudaMemcpyDeviceToHost));
       VerifyResult vr = verify_tensors(dw_cpu.data, dw.data, 1e-4f, 1e-3f);

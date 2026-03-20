@@ -41,20 +41,23 @@ struct TensorNHWC {
   const float* ptr() const { return data.data(); }
 };
 
-struct FilterHWCN {
+// Filter memory is stored output-channel major: [K, R, S, C].
+struct FilterKRSC {
   int r = 0;
   int s = 0;
   int cin_per_group = 0;
   int k = 0;
   std::vector<float> data;
 
-  FilterHWCN() = default;
-  FilterHWCN(int r_, int s_, int cin_per_group_, int k_) : r(r_), s(s_), cin_per_group(cin_per_group_), k(k_), data(static_cast<size_t>(r_) * s_ * cin_per_group_ * k_) {}
+  FilterKRSC() = default;
+  FilterKRSC(int r_, int s_, int cin_per_group_, int k_) : r(r_), s(s_), cin_per_group(cin_per_group_), k(k_), data(static_cast<size_t>(r_) * s_ * cin_per_group_ * k_) {}
 
   size_t elements() const { return static_cast<size_t>(r) * s * cin_per_group * k; }
   float* ptr() { return data.data(); }
   const float* ptr() const { return data.data(); }
 };
+
+using FilterHWCN = FilterKRSC;
 
 struct ConvShape {
   int ho = 0;
@@ -63,7 +66,7 @@ struct ConvShape {
   int kout_group = 0;
 };
 
-inline ConvShape infer_conv_shape(const TensorNHWC& x, const FilterHWCN& w, const Conv2DParams& p) {
+inline ConvShape infer_conv_shape(const TensorNHWC& x, const FilterKRSC& w, const Conv2DParams& p) {
   if (p.groups <= 0) throw std::runtime_error("groups must be > 0");
   if (x.c % p.groups != 0) throw std::runtime_error("input channels must be divisible by groups");
   if (w.k % p.groups != 0) throw std::runtime_error("output channels must be divisible by groups");
@@ -90,8 +93,8 @@ __host__ __device__ inline size_t idx_nhwc(int n, int h, int w, int c, int H, in
   return ((static_cast<size_t>(n) * H + h) * W + w) * C + c;
 }
 
-__host__ __device__ inline size_t idx_hwcn(int r, int s, int c, int n, int S, int C, int N) {
-  return ((static_cast<size_t>(r) * S + s) * C + c) * N + n;
+__host__ __device__ inline size_t idx_krsc(int k, int r, int s, int c, int R, int S, int C) {
+  return ((static_cast<size_t>(k) * R + r) * S + s) * C + c;
 }
 
 struct VerifyResult {
@@ -108,9 +111,9 @@ struct BenchResult {
   float gflops = 0.0f;
 };
 
-void cpu_fprop_nhwc(const TensorNHWC& x, const FilterHWCN& w, const Conv2DParams& p, TensorNHWC& y);
-void cpu_bprop_nhwc(const TensorNHWC& dy, const FilterHWCN& w, const Conv2DParams& p, TensorNHWC& dx);
-void cpu_grad_nhwc(const TensorNHWC& x, const TensorNHWC& dy, const Conv2DParams& p, FilterHWCN& dw);
+void cpu_fprop_nhwc(const TensorNHWC& x, const FilterKRSC& w, const Conv2DParams& p, TensorNHWC& y);
+void cpu_bprop_nhwc(const TensorNHWC& dy, const FilterKRSC& w, const Conv2DParams& p, TensorNHWC& dx);
+void cpu_grad_nhwc(const TensorNHWC& x, const TensorNHWC& dy, const Conv2DParams& p, FilterKRSC& dw);
 
 void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
                        int n, int h, int w, int c, int r, int s, int k,

@@ -15,6 +15,7 @@ option(ENABLE_CUDNN "Enable cuDNN benchmark/reference" ON)
 find_package(CUDAToolkit REQUIRED)
 
 add_executable(conv_bench
+  bmm.cu
   src/main.cpp
   src/cpu_ref.cpp
   src/cuda_kernels.cu
@@ -24,7 +25,7 @@ add_executable(conv_bench
   src/cudnn_ref.cpp
 )
 
-target_include_directories(conv_bench PRIVATE src)
+target_include_directories(conv_bench PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_link_libraries(conv_bench PRIVATE CUDA::cudart)
 

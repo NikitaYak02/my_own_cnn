@@ -1,5 +1,6 @@
 #include "conv_types.h"
 #include "cuda_utils.h"
+#include "bmm.h"
 
 #include <cuda_runtime.h>
 
@@ -92,10 +93,9 @@ void ensure_capacity_int(int** ptr, size_t* cap, size_t elements) {
   *cap = elements;
 }
 
-__global__ void pack_filter_hwcn_group_kernel(const float* __restrict__ w,
+__global__ void pack_filter_krsc_group_kernel(const float* __restrict__ w,
                                               float* __restrict__ wg,
                                               int r, int s, int cin_group,
-                                              int k_total,
                                               int k_base, int kout_group);
 
 __global__ void precompute_spatial_map_kernel(int* __restrict__ spatial_map,
@@ -134,7 +134,7 @@ void ensure_packed_weights(Workspace& ws,
     const int kout_base = g * static_cast<int>(ncol);
     float* dst = ws.d_wg_all + g * per_group;
     int blocks = static_cast<int>((per_group + t - 1) / t);
-    pack_filter_hwcn_group_kernel<<<blocks, t>>>(d_w, dst, r, s, cin_group, k, kout_base, static_cast<int>(ncol));
+    pack_filter_krsc_group_kernel<<<blocks, t>>>(d_w, dst, r, s, cin_group, kout_base, static_cast<int>(ncol));
   }
   CUDA_CHECK(cudaGetLastError());
   ws.packed_w_src = d_w;
@@ -454,28 +454,27 @@ __global__ void unpack_matrix_to_nhwc_group_kernel(const float* __restrict__ src
   dst[idx_nhwc(n_idx, h_idx, w_idx, c_base + col, h, w, c)] = src[idx];
 }
 
-__global__ void pack_filter_hwcn_group_kernel(const float* __restrict__ w,
+__global__ void pack_filter_krsc_group_kernel(const float* __restrict__ w,
                                               float* __restrict__ wg,
                                               int r, int s, int cin_group,
-                                              int k_total,
                                               int k_base, int kout_group) {
   const int kdim = r * s * cin_group;
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int total = kdim * kout_group;
+  const int total = kout_group * kdim;
   if (idx >= total) return;
 
-  const int row = idx / kout_group;
-  const int col = idx - row * kout_group;
+  const int ko = idx / kdim;
+  const int k_idx = idx - ko * kdim;
 
-  const int ci = row % cin_group;
-  const int t = row / cin_group;
+  const int ci = k_idx % cin_group;
+  const int t = k_idx / cin_group;
   const int ss = t % s;
   const int rr = t / s;
 
-  wg[idx] = w[idx_hwcn(rr, ss, ci, k_base + col, s, cin_group, k_total)];
+  wg[idx] = w[idx_krsc(k_base + ko, rr, ss, ci, r, s, cin_group)];
 }
 
-__global__ void unpack_filter_hwcn_group_kernel(const float* __restrict__ wg,
+__global__ void unpack_filter_krsc_group_kernel(const float* __restrict__ wg,
                                                 float* __restrict__ w,
                                                 int r, int s, int cin_group,
                                                 int k_total,
@@ -493,7 +492,7 @@ __global__ void unpack_filter_hwcn_group_kernel(const float* __restrict__ wg,
   const int ss = t % s;
   const int rr = t / s;
 
-  w[idx_hwcn(rr, ss, ci, k_base + col, s, cin_group, k_total)] = wg[idx];
+  w[idx_krsc(k_base + col, rr, ss, ci, r, s, cin_group)] = wg[idx];
 }
 
 __global__ void col2im_accum_nhwc_kernel(const float* __restrict__ dcol,
@@ -762,47 +761,64 @@ void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
                        const Conv2DParams& p,
                        bool use_implicit_precomp) {
   TensorNHWC x_shape(n, h, w, c);
-  FilterHWCN w_shape(r, s, c / p.groups, k);
+  FilterKRSC w_shape(r, s, c / p.groups, k);
   ConvShape sh = infer_conv_shape(x_shape, w_shape, p);
 
   const int m = n * sh.ho * sh.wo;
   const int kdim = r * s * sh.cin_group;
   const int ncol = sh.kout_group;
-  const int rs = r * s;
-  const bool use_vec4 = (sh.cin_group % 4 == 0) && ((c % 4) == 0);
+  const bool can_vec4 = (sh.cin_group % 4 == 0) && (sh.cin_group >= 4) && ((c % 4) == 0);
 
   Workspace& ws = workspace();
+  ensure_capacity(&ws.d_col, &ws.d_col_cap, static_cast<size_t>(m) * kdim);
   ensure_capacity(&ws.d_ymat, &ws.d_ymat_cap, static_cast<size_t>(m) * ncol);
   ensure_packed_weights(ws, d_w, r, s, sh.cin_group, k, p.groups);
-  ensure_spatial_map(ws, h, w, sh.ho, sh.wo, r, s, p.pad_h, p.pad_w, p.stride_h, p.stride_w, p.dilation_h, p.dilation_w);
-  ensure_row_maps(ws, n, h, w, sh.ho, sh.wo, rs);
-  ensure_k_maps(ws, r, s, sh.cin_group);
+  if (use_implicit_precomp) {
+    ensure_spatial_map(ws, h, w, sh.ho, sh.wo, r, s, p.pad_h, p.pad_w, p.stride_h, p.stride_w, p.dilation_h, p.dilation_w);
+  }
+  float* d_col = ws.d_col;
   float* d_ymat = ws.d_ymat;
-  (void)use_implicit_precomp;
 
-  dim3 block(GEMM_TILE_N / GEMM_THREAD_TILE_N, GEMM_TILE_M / GEMM_THREAD_TILE_M);
-  dim3 grid((ncol + GEMM_TILE_N - 1) / GEMM_TILE_N, (m + GEMM_TILE_M - 1) / GEMM_TILE_M);
-
+  const int t = 256;
   for (int g = 0; g < p.groups; ++g) {
     const int cin_base = g * sh.cin_group;
     const int kout_base = g * sh.kout_group;
-    float* d_wg = ws.d_wg_all + static_cast<size_t>(g) * kdim * ncol;
-    const bool group_vec4 = use_vec4 && ((cin_base % 4) == 0);
-    fprop_implicit_gemm_kernel<<<grid, block>>>(d_x, d_wg,
-                                                 ws.d_row_nhw_base,
-                                                 ws.d_row_spatial_base,
-                                                 ws.d_k_ci,
-                                                 ws.d_k_rs,
-                                                 ws.d_spatial_map,
-                                                 d_ymat,
-                                                 n, h, w, c,
-                                                 sh.ho, sh.wo,
-                                                 r, s,
-                                                 p.pad_h, p.pad_w,
-                                                 p.stride_h, p.stride_w,
-                                                 p.dilation_h, p.dilation_w,
-                                                 cin_base, sh.cin_group, ncol, group_vec4);
-    const int t = 256;
+
+    int total_col = m * kdim;
+    int blocks_col = (total_col + t - 1) / t;
+    if (use_implicit_precomp) {
+      if (can_vec4 && (cin_base % 4 == 0)) {
+        const int total_vec = m * r * s * (sh.cin_group / 4);
+        const int blocks_vec = (total_vec + t - 1) / t;
+        im2col_nhwc_precomp_vec4_kernel<<<blocks_vec, t>>>(d_x, ws.d_spatial_map, d_col, n, h, w, c, sh.ho, sh.wo, r, s, cin_base, sh.cin_group);
+      } else {
+        im2col_nhwc_precomp_kernel<<<blocks_col, t>>>(d_x, ws.d_spatial_map, d_col, n, h, w, c, sh.ho, sh.wo, r, s, cin_base, sh.cin_group);
+      }
+    } else {
+      if (can_vec4 && (cin_base % 4 == 0)) {
+        const int total_vec = m * r * s * (sh.cin_group / 4);
+        const int blocks_vec = (total_vec + t - 1) / t;
+        im2col_nhwc_vec4_kernel<<<blocks_vec, t>>>(d_x, d_col, n, h, w, c,
+                                                   sh.ho, sh.wo,
+                                                   r, s,
+                                                   p.pad_h, p.pad_w,
+                                                   p.stride_h, p.stride_w,
+                                                   p.dilation_h, p.dilation_w,
+                                                   cin_base, sh.cin_group);
+      } else {
+        im2col_nhwc_kernel<<<blocks_col, t>>>(d_x, d_col, n, h, w, c,
+                                              sh.ho, sh.wo,
+                                              r, s,
+                                              p.pad_h, p.pad_w,
+                                              p.stride_h, p.stride_w,
+                                              p.dilation_h, p.dilation_w,
+                                              cin_base, sh.cin_group);
+      }
+    }
+
+    float* d_wg = ws.d_wg_all + static_cast<size_t>(g) * ncol * kdim;
+    bmm_fprop(d_col, d_wg, d_ymat, 1, m, ncol, kdim);
+
     int total_ym = m * ncol;
     int blocks_ym = (total_ym + t - 1) / t;
     unpack_matrix_to_nhwc_group_kernel<<<blocks_ym, t>>>(d_ymat, d_y, n, sh.ho, sh.wo, k, kout_base, sh.kout_group);
@@ -816,7 +832,7 @@ void launch_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
                        const Conv2DParams& p,
                        bool use_implicit_precomp) {
   TensorNHWC x_shape(n, h, w, c);
-  FilterHWCN w_shape(r, s, c / p.groups, k);
+  FilterKRSC w_shape(r, s, c / p.groups, k);
   ConvShape sh = infer_conv_shape(x_shape, w_shape, p);
 
   const int m = n * sh.ho * sh.wo;
@@ -845,9 +861,8 @@ void launch_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
     int blocks_dy = (total_dy + t - 1) / t;
     pack_nhwc_group_matrix_kernel<<<blocks_dy, t>>>(d_dy, d_dy_mat, n, sh.ho, sh.wo, k, kout_base, sh.kout_group);
 
-    float* d_wg = ws.d_wg_all + static_cast<size_t>(g) * kdim * ncol;
-
-    launch_gemm(d_dy_mat, d_wg, d_dcol, m, kdim, ncol, false, true, 1.0f, 0.0f);
+    float* d_wg = ws.d_wg_all + static_cast<size_t>(g) * ncol * kdim;
+    bmm_bprop_dA(d_dy_mat, d_wg, d_dcol, 1, m, ncol, kdim);
 
     int total_dcol = m * kdim;
     int blocks_dcol = (total_dcol + t - 1) / t;
@@ -873,7 +888,7 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                       const Conv2DParams& p,
                       bool use_implicit_precomp) {
   TensorNHWC x_shape(n, h, w, c);
-  FilterHWCN w_shape(r, s, c / p.groups, k);
+  FilterKRSC w_shape(r, s, c / p.groups, k);
   ConvShape sh = infer_conv_shape(x_shape, w_shape, p);
 
   const int m = n * sh.ho * sh.wo;
@@ -936,11 +951,11 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
     int blocks_dy = (total_dy + t - 1) / t;
     pack_nhwc_group_matrix_kernel<<<blocks_dy, t>>>(d_dy, d_dy_mat, n, sh.ho, sh.wo, k, kout_base, sh.kout_group);
 
-    launch_gemm(d_col, d_dy_mat, d_dwg, kdim, ncol, m, true, false, 1.0f, 0.0f);
+    bmm_bprop_dB(d_col, d_dy_mat, d_dwg, 1, m, kdim, ncol);
 
     int total_wg = kdim * ncol;
     int blocks_wg = (total_wg + t - 1) / t;
-    unpack_filter_hwcn_group_kernel<<<blocks_wg, t>>>(d_dwg, d_dw, r, s, sh.cin_group, k, kout_base, sh.kout_group);
+    unpack_filter_krsc_group_kernel<<<blocks_wg, t>>>(d_dwg, d_dw, r, s, sh.cin_group, k, kout_base, sh.kout_group);
   }
 
   CUDA_CHECK(cudaGetLastError());

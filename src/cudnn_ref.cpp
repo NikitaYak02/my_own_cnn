@@ -102,36 +102,6 @@ const char* math_type_to_string(cudnnMathType_t math_type) {
   }
 }
 
-void hwcn_to_krsc_host(const std::vector<float>& hwcn, std::vector<float>& krsc, int r, int s, int cin_group, int k_total) {
-  krsc.resize(static_cast<size_t>(k_total) * r * s * cin_group);
-  for (int kk = 0; kk < k_total; ++kk) {
-    for (int rr = 0; rr < r; ++rr) {
-      for (int ss = 0; ss < s; ++ss) {
-        for (int ci = 0; ci < cin_group; ++ci) {
-          const size_t src = idx_hwcn(rr, ss, ci, kk, s, cin_group, k_total);
-          const size_t dst = ((static_cast<size_t>(kk) * r + rr) * s + ss) * cin_group + ci;
-          krsc[dst] = hwcn[src];
-        }
-      }
-    }
-  }
-}
-
-void krsc_to_hwcn_host(const std::vector<float>& krsc, std::vector<float>& hwcn, int r, int s, int cin_group, int k_total) {
-  hwcn.resize(static_cast<size_t>(k_total) * r * s * cin_group);
-  for (int kk = 0; kk < k_total; ++kk) {
-    for (int rr = 0; rr < r; ++rr) {
-      for (int ss = 0; ss < s; ++ss) {
-        for (int ci = 0; ci < cin_group; ++ci) {
-          const size_t src = ((static_cast<size_t>(kk) * r + rr) * s + ss) * cin_group + ci;
-          const size_t dst = idx_hwcn(rr, ss, ci, kk, s, cin_group, k_total);
-          hwcn[dst] = krsc[src];
-        }
-      }
-    }
-  }
-}
-
 }  // namespace
 
 bool cudnn_is_available() { return true; }
@@ -141,7 +111,7 @@ BenchResult cudnn_fprop_bench(const float* d_x, const float* d_w, float* d_y,
                               const Conv2DParams& p,
                               int warmup, int iters) {
   TensorNHWC xt(n, h, w, c);
-  FilterHWCN wt(r, s, c / p.groups, k);
+  FilterKRSC wt(r, s, c / p.groups, k);
   ConvShape sh = infer_conv_shape(xt, wt, p);
 
   CudnnHandle handle;
@@ -150,14 +120,6 @@ BenchResult cudnn_fprop_bench(const float* d_x, const float* d_w, float* d_y,
 
   const int cin_group = c / p.groups;
   const int total_w = k * r * s * cin_group;
-  float* d_w_krsc = nullptr;
-  CUDA_CHECK(cudaMalloc(&d_w_krsc, static_cast<size_t>(total_w) * sizeof(float)));
-  std::vector<float> h_w_hwcn(static_cast<size_t>(total_w));
-  std::vector<float> h_w_krsc;
-  CUDA_CHECK(cudaMemcpy(h_w_hwcn.data(), d_w, static_cast<size_t>(total_w) * sizeof(float), cudaMemcpyDeviceToHost));
-  hwcn_to_krsc_host(h_w_hwcn, h_w_krsc, r, s, cin_group, k);
-  CUDA_CHECK(cudaMemcpy(d_w_krsc, h_w_krsc.data(), static_cast<size_t>(total_w) * sizeof(float), cudaMemcpyHostToDevice));
-
   int returned = 0;
   cudnnConvolutionFwdAlgoPerf_t perf{};
   CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithm_v7(handle.h, d.x, d.w, d.conv, d.y, 1, &returned, &perf));
@@ -181,14 +143,13 @@ BenchResult cudnn_fprop_bench(const float* d_x, const float* d_w, float* d_y,
   const float alpha = 1.0f;
   const float beta = 0.0f;
   auto fn = [&]() {
-    CUDNN_CHECK(cudnnConvolutionForward(handle.h, &alpha, d.x, d_x, d.w, d_w_krsc, d.conv, algo, ws, ws_size, &beta, d.y, d_y));
+    CUDNN_CHECK(cudnnConvolutionForward(handle.h, &alpha, d.x, d_x, d.w, d_w, d.conv, algo, ws, ws_size, &beta, d.y, d_y));
   };
 
   const size_t flops = static_cast<size_t>(2ULL) * n * sh.ho * sh.wo * r * s * (c / p.groups) * k;
   BenchResult out = run_bench(flops, warmup, iters, fn);
 
   if (ws) CUDA_CHECK(cudaFree(ws));
-  CUDA_CHECK(cudaFree(d_w_krsc));
   return out;
 }
 
@@ -197,7 +158,7 @@ BenchResult cudnn_bprop_bench(const float* d_dy, const float* d_w, float* d_dx,
                               const Conv2DParams& p,
                               int warmup, int iters) {
   TensorNHWC xt(n, h, w, c);
-  FilterHWCN wt(r, s, c / p.groups, k);
+  FilterKRSC wt(r, s, c / p.groups, k);
   ConvShape sh = infer_conv_shape(xt, wt, p);
 
   CudnnHandle handle;
@@ -206,14 +167,6 @@ BenchResult cudnn_bprop_bench(const float* d_dy, const float* d_w, float* d_dx,
 
   const int cin_group = c / p.groups;
   const int total_w = k * r * s * cin_group;
-  float* d_w_krsc = nullptr;
-  CUDA_CHECK(cudaMalloc(&d_w_krsc, static_cast<size_t>(total_w) * sizeof(float)));
-  std::vector<float> h_w_hwcn(static_cast<size_t>(total_w));
-  std::vector<float> h_w_krsc;
-  CUDA_CHECK(cudaMemcpy(h_w_hwcn.data(), d_w, static_cast<size_t>(total_w) * sizeof(float), cudaMemcpyDeviceToHost));
-  hwcn_to_krsc_host(h_w_hwcn, h_w_krsc, r, s, cin_group, k);
-  CUDA_CHECK(cudaMemcpy(d_w_krsc, h_w_krsc.data(), static_cast<size_t>(total_w) * sizeof(float), cudaMemcpyHostToDevice));
-
   int returned = 0;
   cudnnConvolutionBwdDataAlgoPerf_t perf{};
   CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm_v7(handle.h, d.w, d.dy, d.conv, d.dx, 1, &returned, &perf));
@@ -230,14 +183,13 @@ BenchResult cudnn_bprop_bench(const float* d_dy, const float* d_w, float* d_dx,
   const float alpha = 1.0f;
   const float beta = 0.0f;
   auto fn = [&]() {
-    CUDNN_CHECK(cudnnConvolutionBackwardData(handle.h, &alpha, d.w, d_w_krsc, d.dy, d_dy, d.conv, algo, ws, ws_size, &beta, d.dx, d_dx));
+    CUDNN_CHECK(cudnnConvolutionBackwardData(handle.h, &alpha, d.w, d_w, d.dy, d_dy, d.conv, algo, ws, ws_size, &beta, d.dx, d_dx));
   };
 
   const size_t flops = static_cast<size_t>(2ULL) * n * sh.ho * sh.wo * r * s * (c / p.groups) * k;
   BenchResult out = run_bench(flops, warmup, iters, fn);
 
   if (ws) CUDA_CHECK(cudaFree(ws));
-  CUDA_CHECK(cudaFree(d_w_krsc));
   return out;
 }
 
@@ -246,7 +198,7 @@ BenchResult cudnn_grad_bench(const float* d_x, const float* d_dy, float* d_dw,
                              const Conv2DParams& p,
                              int warmup, int iters) {
   TensorNHWC xt(n, h, w, c);
-  FilterHWCN wt(r, s, c / p.groups, k);
+  FilterKRSC wt(r, s, c / p.groups, k);
   ConvShape sh = infer_conv_shape(xt, wt, p);
 
   CudnnHandle handle;
@@ -280,11 +232,7 @@ BenchResult cudnn_grad_bench(const float* d_x, const float* d_dy, float* d_dw,
   const size_t flops = static_cast<size_t>(2ULL) * n * sh.ho * sh.wo * r * s * (c / p.groups) * k;
   BenchResult out = run_bench(flops, warmup, iters, fn);
 
-  std::vector<float> h_dw_krsc(static_cast<size_t>(total_w));
-  std::vector<float> h_dw_hwcn;
-  CUDA_CHECK(cudaMemcpy(h_dw_krsc.data(), d_dw_krsc, static_cast<size_t>(total_w) * sizeof(float), cudaMemcpyDeviceToHost));
-  krsc_to_hwcn_host(h_dw_krsc, h_dw_hwcn, r, s, cin_group, k);
-  CUDA_CHECK(cudaMemcpy(d_dw, h_dw_hwcn.data(), static_cast<size_t>(total_w) * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_dw, d_dw_krsc, static_cast<size_t>(total_w) * sizeof(float), cudaMemcpyDeviceToDevice));
 
   if (ws) CUDA_CHECK(cudaFree(ws));
   CUDA_CHECK(cudaFree(d_dw_krsc));
