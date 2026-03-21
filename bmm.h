@@ -5,31 +5,29 @@ extern "C" {
 #endif
 
 /*
- * Batched Matrix Multiplication layer.
+ * Row-major batched matrix multiplication.
  *
- * Forward:   Y[N,W,H] = A[N,W,C] @ B[N,H,C]^T
- * Backward:  dA[N,W,C] = dY[N,W,H] @ B[N,H,C]
- *            dB[N,H,C] = dY[N,W,H]^T @ A[N,W,C]
+ * Computes, for each batch item:
+ *   C[M, N] = op(A)[M, K] @ op(B)[K, N]
+ *
+ * Layout conventions:
+ *   trans_a == 0: A is stored as [M, K]
+ *   trans_a != 0: A is stored as [K, M] and read as A^T
+ *   trans_b == 0: B is stored as [K, N]
+ *   trans_b != 0: B is stored as [N, K] and read as B^T
  *
  * All pointers must reside in device memory.
  */
 
-void bmm_fprop(
-    const float* A, const float* B, float* Y,
-    int N, int W, int H, int C);
+enum BmmTranspose {
+    BMM_TRANSPOSE_NONE = 0,
+    BMM_TRANSPOSE_YES = 1,
+};
 
-void bmm_bprop_dA(
-    const float* dY, const float* B, float* dA,
-    int N, int W, int H, int C);
-
-void bmm_bprop_dB(
-    const float* dY, const float* A, float* dB,
-    int N, int W, int H, int C);
-
-void bmm_bprop(
-    const float* A, const float* B, const float* dY,
-    float* dA, float* dB,
-    int N, int W, int H, int C);
+void bmm_matmul(
+    const float* A, const float* B, float* C,
+    int batch, int M, int N, int K,
+    int trans_a, int trans_b);
 
 #ifdef __cplusplus
 }

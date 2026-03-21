@@ -667,93 +667,6 @@ __global__ void fprop_implicit_gemm_kernel(const float* __restrict__ x,
   if (row0 + 1 < m && col0 + 1 < ncol) ymat[(row0 + 1) * ncol + (col0 + 1)] = acc[1][1];
 }
 
-template <bool TRANS_A, bool TRANS_B>
-__global__ void gemm_tiled_kernel(const float* __restrict__ A,
-                                  const float* __restrict__ B,
-                                  float* __restrict__ C,
-                                  int M, int N, int K,
-                                  float alpha, float beta) {
-  __shared__ float As[GEMM_TILE_M][GEMM_TILE_K + 1];
-  __shared__ float Bs[GEMM_TILE_K][GEMM_TILE_N + 1];
-
-  const int tx = threadIdx.x;
-  const int ty = threadIdx.y;
-  const int tid = ty * blockDim.x + tx;
-  const int block_row = blockIdx.y * GEMM_TILE_M;
-  const int block_col = blockIdx.x * GEMM_TILE_N;
-  const int row0 = block_row + ty * GEMM_THREAD_TILE_M;
-  const int col0 = block_col + tx * GEMM_THREAD_TILE_N;
-
-  float acc[GEMM_THREAD_TILE_M][GEMM_THREAD_TILE_N] = {{0.0f, 0.0f}, {0.0f, 0.0f}};
-
-  for (int k0 = 0; k0 < K; k0 += GEMM_TILE_K) {
-    const int a_row = tid / GEMM_TILE_K;
-    const int a_col = tid % GEMM_TILE_K;
-    const int g_a_row = block_row + a_row;
-    const int g_a_col = k0 + a_col;
-    if (g_a_row < M && g_a_col < K) {
-      As[a_row][a_col] = TRANS_A ? A[g_a_col * M + g_a_row] : A[g_a_row * K + g_a_col];
-    } else {
-      As[a_row][a_col] = 0.0f;
-    }
-
-    const int b_row = tid / GEMM_TILE_N;
-    const int b_col = tid % GEMM_TILE_N;
-    const int g_b_row = k0 + b_row;
-    const int g_b_col = block_col + b_col;
-    if (g_b_row < K && g_b_col < N) {
-      Bs[b_row][b_col] = TRANS_B ? B[g_b_col * K + g_b_row] : B[g_b_row * N + g_b_col];
-    } else {
-      Bs[b_row][b_col] = 0.0f;
-    }
-
-    __syncthreads();
-    #pragma unroll
-    for (int kk = 0; kk < GEMM_TILE_K; ++kk) {
-      const float a0 = (row0 + 0 < M) ? As[ty * GEMM_THREAD_TILE_M + 0][kk] : 0.0f;
-      const float a1 = (row0 + 1 < M) ? As[ty * GEMM_THREAD_TILE_M + 1][kk] : 0.0f;
-      const float b0 = (col0 + 0 < N) ? Bs[kk][tx * GEMM_THREAD_TILE_N + 0] : 0.0f;
-      const float b1 = (col0 + 1 < N) ? Bs[kk][tx * GEMM_THREAD_TILE_N + 1] : 0.0f;
-      acc[0][0] += a0 * b0;
-      acc[0][1] += a0 * b1;
-      acc[1][0] += a1 * b0;
-      acc[1][1] += a1 * b1;
-    }
-    __syncthreads();
-  }
-
-  if (row0 + 0 < M && col0 + 0 < N) {
-    const int idx = (row0 + 0) * N + (col0 + 0);
-    C[idx] = alpha * acc[0][0] + beta * C[idx];
-  }
-  if (row0 + 0 < M && col0 + 1 < N) {
-    const int idx = (row0 + 0) * N + (col0 + 1);
-    C[idx] = alpha * acc[0][1] + beta * C[idx];
-  }
-  if (row0 + 1 < M && col0 + 0 < N) {
-    const int idx = (row0 + 1) * N + (col0 + 0);
-    C[idx] = alpha * acc[1][0] + beta * C[idx];
-  }
-  if (row0 + 1 < M && col0 + 1 < N) {
-    const int idx = (row0 + 1) * N + (col0 + 1);
-    C[idx] = alpha * acc[1][1] + beta * C[idx];
-  }
-}
-
-void launch_gemm(const float* A, const float* B, float* C, int M, int N, int K, bool transA, bool transB, float alpha = 1.0f, float beta = 0.0f) {
-  dim3 block(GEMM_TILE_N / GEMM_THREAD_TILE_N, GEMM_TILE_M / GEMM_THREAD_TILE_M);
-  dim3 grid((N + GEMM_TILE_N - 1) / GEMM_TILE_N, (M + GEMM_TILE_M - 1) / GEMM_TILE_M);
-  if (!transA && !transB) {
-    gemm_tiled_kernel<false, false><<<grid, block>>>(A, B, C, M, N, K, alpha, beta);
-  } else if (!transA && transB) {
-    gemm_tiled_kernel<false, true><<<grid, block>>>(A, B, C, M, N, K, alpha, beta);
-  } else if (transA && !transB) {
-    gemm_tiled_kernel<true, false><<<grid, block>>>(A, B, C, M, N, K, alpha, beta);
-  } else {
-    gemm_tiled_kernel<true, true><<<grid, block>>>(A, B, C, M, N, K, alpha, beta);
-  }
-}
-
 }  // namespace
 
 void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
@@ -817,7 +730,7 @@ void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
     }
 
     float* d_wg = ws.d_wg_all + static_cast<size_t>(g) * ncol * kdim;
-    bmm_fprop(d_col, d_wg, d_ymat, 1, m, ncol, kdim);
+    bmm_matmul(d_col, d_wg, d_ymat, 1, m, ncol, kdim, BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_YES);
 
     int total_ym = m * ncol;
     int blocks_ym = (total_ym + t - 1) / t;
@@ -862,7 +775,7 @@ void launch_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
     pack_nhwc_group_matrix_kernel<<<blocks_dy, t>>>(d_dy, d_dy_mat, n, sh.ho, sh.wo, k, kout_base, sh.kout_group);
 
     float* d_wg = ws.d_wg_all + static_cast<size_t>(g) * ncol * kdim;
-    bmm_bprop_dA(d_dy_mat, d_wg, d_dcol, 1, m, ncol, kdim);
+    bmm_matmul(d_dy_mat, d_wg, d_dcol, 1, m, kdim, ncol, BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_NONE);
 
     int total_dcol = m * kdim;
     int blocks_dcol = (total_dcol + t - 1) / t;
@@ -951,7 +864,7 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
     int blocks_dy = (total_dy + t - 1) / t;
     pack_nhwc_group_matrix_kernel<<<blocks_dy, t>>>(d_dy, d_dy_mat, n, sh.ho, sh.wo, k, kout_base, sh.kout_group);
 
-    bmm_bprop_dB(d_col, d_dy_mat, d_dwg, 1, m, kdim, ncol);
+    bmm_matmul(d_col, d_dy_mat, d_dwg, 1, kdim, ncol, m, BMM_TRANSPOSE_YES, BMM_TRANSPOSE_NONE);
 
     int total_wg = kdim * ncol;
     int blocks_wg = (total_wg + t - 1) / t;

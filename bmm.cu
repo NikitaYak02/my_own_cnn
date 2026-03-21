@@ -174,48 +174,88 @@ __global__ void bmm_bprop_dB_kernel(
 }
 
 /* ================================================================== */
+/*                  GENERIC FALLBACK:  C = A^T @ B^T                  */
+/* ================================================================== */
+/*  This path is only used for the transpose/transpose case.          */
+/* ------------------------------------------------------------------ */
+
+template <bool TRANS_A, bool TRANS_B>
+__global__ void bmm_generic_kernel(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int n   = blockIdx.z;
+    const int row = blockIdx.y * BMM_TILE + threadIdx.y;
+    const int col = blockIdx.x * BMM_TILE + threadIdx.x;
+
+    const float* An = A + static_cast<size_t>(n) * M * K;
+    const float* Bn = B + static_cast<size_t>(n) * K * N;
+    float*       Cn = C + static_cast<size_t>(n) * M * N;
+
+    __shared__ float sA[BMM_TILE][BMM_TILE + BMM_PAD];
+    __shared__ float sB[BMM_TILE][BMM_TILE + BMM_PAD];
+
+    float acc = 0.0f;
+
+    for (int t = 0; t < (K + BMM_TILE - 1) / BMM_TILE; ++t) {
+        const int k_a = t * BMM_TILE + threadIdx.x;
+        const int k_b = t * BMM_TILE + threadIdx.y;
+
+        sA[threadIdx.y][threadIdx.x] =
+            (row < M && k_a < K)
+                ? (TRANS_A ? An[k_a * M + row] : An[row * K + k_a])
+                : 0.0f;
+
+        sB[threadIdx.y][threadIdx.x] =
+            (k_b < K && col < N)
+                ? (TRANS_B ? Bn[col * K + k_b] : Bn[k_b * N + col])
+                : 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < BMM_TILE; ++kk) {
+            acc += sA[threadIdx.y][kk] * sB[kk][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        Cn[row * N + col] = acc;
+    }
+}
+
+/* ================================================================== */
 /*                          HOST  WRAPPERS                            */
 /* ================================================================== */
 
-void bmm_fprop(
-    const float* A, const float* B, float* Y,
-    int N, int W, int H, int C)
+extern "C" void bmm_matmul(
+    const float* A, const float* B, float* C,
+    int batch, int M, int N, int K,
+    int trans_a, int trans_b)
 {
     dim3 block(BMM_TILE, BMM_TILE);
-    dim3 grid((H + BMM_TILE - 1) / BMM_TILE,
-              (W + BMM_TILE - 1) / BMM_TILE,
-              N);
+    dim3 grid((N + BMM_TILE - 1) / BMM_TILE,
+              (M + BMM_TILE - 1) / BMM_TILE,
+              batch);
 
-    bmm_fprop_kernel<<<grid, block>>>(A, B, Y, W, H, C);
-}
+    if (!trans_a && trans_b) {
+        bmm_fprop_kernel<<<grid, block>>>(A, B, C, M, N, K);
+        return;
+    }
 
-void bmm_bprop_dA(
-    const float* dY, const float* B, float* dA,
-    int N, int W, int H, int C)
-{
-    dim3 block(BMM_TILE, BMM_TILE);
-    dim3 grid((C + BMM_TILE - 1) / BMM_TILE,
-              (W + BMM_TILE - 1) / BMM_TILE,
-              N);
-    bmm_bprop_dA_kernel<<<grid, block>>>(dY, B, dA, W, H, C);
-}
+    if (!trans_a && !trans_b) {
+        bmm_bprop_dA_kernel<<<grid, block>>>(A, B, C, M, K, N);
+        return;
+    }
 
-void bmm_bprop_dB(
-    const float* dY, const float* A, float* dB,
-    int N, int W, int H, int C)
-{
-    dim3 block(BMM_TILE, BMM_TILE);
-    dim3 grid((C + BMM_TILE - 1) / BMM_TILE,
-              (H + BMM_TILE - 1) / BMM_TILE,
-              N);
-    bmm_bprop_dB_kernel<<<grid, block>>>(dY, A, dB, W, H, C);
-}
+    if (trans_a && !trans_b) {
+        bmm_bprop_dB_kernel<<<grid, block>>>(A, B, C, K, M, N);
+        return;
+    }
 
-void bmm_bprop(
-    const float* A, const float* B, const float* dY,
-    float* dA, float* dB,
-    int N, int W, int H, int C)
-{
-    bmm_bprop_dA(dY, B, dA, N, W, H, C);
-    bmm_bprop_dB(dY, A, dB, N, W, H, C);
+    bmm_generic_kernel<true, true><<<grid, block>>>(A, B, C, M, N, K);
 }
