@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.24)
 project(conv_bench LANGUAGES CXX CUDA)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -14,6 +16,15 @@ option(ENABLE_CUDNN "Enable cuDNN benchmark/reference" ON)
 
 find_package(CUDAToolkit REQUIRED)
 
+function(configure_cuda_target target_name)
+  target_include_directories(${target_name} PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(${target_name} PRIVATE CUDA::cudart)
+  set_target_properties(${target_name} PROPERTIES
+    CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}
+    CUDA_SEPARABLE_COMPILATION ON
+  )
+endfunction()
+
 add_executable(conv_bench
   bmm.cu
   src/main.cpp
@@ -25,9 +36,23 @@ add_executable(conv_bench
   src/cudnn_ref.cpp
 )
 
-target_include_directories(conv_bench PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
+configure_cuda_target(conv_bench)
 
-target_link_libraries(conv_bench PRIVATE CUDA::cudart)
+add_executable(bmm_bench
+  bmm.cu
+  bmm_bench.cu
+)
+
+configure_cuda_target(bmm_bench)
+target_link_libraries(bmm_bench PRIVATE CUDA::cublas)
+
+add_executable(bmm_test
+  bmm.cu
+  bmm_test.cu
+)
+
+configure_cuda_target(bmm_test)
+target_link_libraries(bmm_test PRIVATE CUDA::cublas)
 
 if(ENABLE_CUDNN)
   find_path(CUDNN_INCLUDE_DIR cudnn.h
@@ -56,7 +81,27 @@ if(ENABLE_CUDNN)
   endif()
 endif()
 
-set_target_properties(conv_bench PROPERTIES
-  CUDA_ARCHITECTURES 75
-  CUDA_SEPARABLE_COMPILATION ON
-)
+if(BUILD_TESTING)
+  add_test(NAME bmm_test_tiny_1x1x1x1
+    COMMAND bmm_test --case tiny_1x1x1x1)
+  add_test(NAME bmm_test_irregular_17x19x13
+    COMMAND bmm_test --case irregular_17x19x13)
+  add_test(NAME bmm_test_shape_128x32x16
+    COMMAND bmm_test --case shape_128x32x16)
+  add_test(NAME bmm_test_default_64x64x128
+    COMMAND bmm_test --case default_64x64x128)
+  add_test(NAME bmm_test_wide_128x128x256
+    COMMAND bmm_test --case wide_128x128x256)
+  add_test(NAME bmm_test_tall_256x64x256
+    COMMAND bmm_test --case tall_256x64x256)
+
+  set_tests_properties(
+    bmm_test_tiny_1x1x1x1
+    bmm_test_irregular_17x19x13
+    bmm_test_shape_128x32x16
+    bmm_test_default_64x64x128
+    bmm_test_wide_128x128x256
+    bmm_test_tall_256x64x256
+    PROPERTIES LABELS "bmm"
+  )
+endif()
