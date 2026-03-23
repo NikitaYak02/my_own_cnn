@@ -223,22 +223,19 @@ CaseResult run_case(const Case& tc, int warmup, int iters, float eps) {
     // forward output, gradient w.r.t. the left operand, and gradient w.r.t.
     // the right operand.
     auto custom_fprop = [&]() {
-        bmm_matmul(dA, dB, dCustomY, tc.N, tc.W, tc.H, tc.C,
-                   BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_YES);
+        bmm_fprop(dA, dB, dCustomY, tc.N, tc.W, tc.H, tc.C);
     };
     auto ref_fprop = [&]() {
         cublas_bmm_fprop(handle, dA, dB, dCublasY, tc.N, tc.W, tc.H, tc.C);
     };
     auto custom_dA = [&]() {
-        bmm_matmul(dDY, dB, dCustomDA, tc.N, tc.W, tc.C, tc.H,
-                   BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_NONE);
+        bmm_bprop_dA(dDY, dB, dCustomDA, tc.N, tc.W, tc.H, tc.C);
     };
     auto ref_dA = [&]() {
         cublas_bmm_bprop_dA(handle, dDY, dB, dCublasDA, tc.N, tc.W, tc.H, tc.C);
     };
     auto custom_dB = [&]() {
-        bmm_matmul(dDY, dA, dCustomDB, tc.N, tc.H, tc.C, tc.W,
-                   BMM_TRANSPOSE_YES, BMM_TRANSPOSE_NONE);
+        bmm_bprop_dB(dDY, dA, dCustomDB, tc.N, tc.W, tc.H, tc.C);
     };
     auto ref_dB = [&]() {
         cublas_bmm_bprop_dB(handle, dDY, dA, dCublasDB, tc.N, tc.W, tc.H, tc.C);

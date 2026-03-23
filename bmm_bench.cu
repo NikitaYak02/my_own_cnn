@@ -158,12 +158,12 @@ static int g_N, g_W, g_H, g_C;
 static cublasHandle_t g_handle;
 
 static void run_custom_fprop(void) {
-    bmm_matmul(g_A, g_B, g_Y, g_N, g_W, g_H, g_C, BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_YES);
+    bmm_fprop(g_A, g_B, g_Y, g_N, g_W, g_H, g_C);
 }
 
 static void run_custom_bprop(void) {
-    bmm_matmul(g_dY, g_B, g_dA, g_N, g_W, g_C, g_H, BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_NONE);
-    bmm_matmul(g_dY, g_A, g_dB, g_N, g_H, g_C, g_W, BMM_TRANSPOSE_YES, BMM_TRANSPOSE_NONE);
+    bmm_bprop_dA(g_dY, g_B, g_dA, g_N, g_W, g_H, g_C);
+    bmm_bprop_dB(g_dY, g_A, g_dB, g_N, g_W, g_H, g_C);
 }
 
 static void run_cublas_fprop(void)  { cublas_bmm_fprop(g_handle, g_A, g_B, g_Y_ref, g_N, g_W, g_H, g_C); }
@@ -241,7 +241,7 @@ int main(int argc, char** argv)
     /* ============================================================= */
 
     /* fprop */
-    bmm_matmul(dA, dB, dY_out, N, W, H, C, BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_YES);
+    bmm_fprop(dA, dB, dY_out, N, W, H, C);
     cublas_bmm_fprop(g_handle, dA, dB, dY_ref, N, W, H, C);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -251,8 +251,8 @@ int main(int argc, char** argv)
            max_abs_diff(hY_custom, hY_cublas, (size_t)N * W * H));
 
     /* bprop */
-    bmm_matmul(dY_d, dB, ddA, N, W, C, H, BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_NONE);
-    bmm_matmul(dY_d, dA, ddB, N, H, C, W, BMM_TRANSPOSE_YES, BMM_TRANSPOSE_NONE);
+    bmm_bprop_dA(dY_d, dB, ddA, N, W, H, C);
+    bmm_bprop_dB(dY_d, dA, ddB, N, W, H, C);
     cublas_bmm_bprop_dA(g_handle, dY_d, dB, ddA_ref, N, W, H, C);
     cublas_bmm_bprop_dB(g_handle, dY_d, dA, ddB_ref, N, W, H, C);
     CUDA_CHECK(cudaDeviceSynchronize());

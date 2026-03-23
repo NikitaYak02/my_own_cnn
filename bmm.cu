@@ -1,3 +1,5 @@
+#include "bmm.h"
+
 #include <cuda_runtime.h>
 #include <stdio.h>
 
@@ -179,4 +181,43 @@ extern "C" void bmm_matmul(
     }
 
     launch_bmm_kernel<true, true>(A, B, C, batch, M, N, K);
+}
+
+extern "C" void bmm_fprop(
+    const float* A, const float* B, float* Y,
+    int N, int W, int H, int C)
+{
+    bmm_matmul(
+        A, B, Y,
+        N, W, H, C,
+        BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_YES);
+}
+
+extern "C" void bmm_bprop_dA(
+    const float* dY, const float* B, float* dA,
+    int N, int W, int H, int C)
+{
+    bmm_matmul(
+        dY, B, dA,
+        N, W, C, H,
+        BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_NONE);
+}
+
+extern "C" void bmm_bprop_dB(
+    const float* dY, const float* A, float* dB,
+    int N, int W, int H, int C)
+{
+    bmm_matmul(
+        dY, A, dB,
+        N, H, C, W,
+        BMM_TRANSPOSE_YES, BMM_TRANSPOSE_NONE);
+}
+
+extern "C" void bmm_bprop(
+    const float* A, const float* B, const float* dY,
+    float* dA, float* dB,
+    int N, int W, int H, int C)
+{
+    bmm_bprop_dA(dY, B, dA, N, W, H, C);
+    bmm_bprop_dB(dY, A, dB, N, W, H, C);
 }
