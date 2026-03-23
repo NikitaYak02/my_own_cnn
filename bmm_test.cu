@@ -30,6 +30,8 @@
 
 namespace {
 
+// Test dimensions reuse the project naming convention:
+//   N - batch, W - left rows, H - right rows before transpose, C - reduction dim.
 struct Case {
     const char* name;
     int N;
@@ -52,6 +54,7 @@ struct CaseResult {
     Timing bprop_dB;
 };
 
+// Cover both tiny edge cases and the production-like shapes used in the repo.
 std::vector<Case> default_cases() {
     return {
         {"tiny_1x1x1x1", 1, 1, 1, 1},
@@ -78,6 +81,11 @@ float max_abs_diff(const std::vector<float>& a, const std::vector<float>& b) {
     return mx;
 }
 
+/*
+ * cuBLAS expects column-major matrices, while the project stores everything in
+ * row-major form. These wrappers encode the standard row-major-to-column-major
+ * mapping so the rest of the test can compare logical operations directly.
+ */
 static void cublas_bmm_fprop(
     cublasHandle_t handle,
     const float* A, const float* B, float* Y,
@@ -135,6 +143,7 @@ static void cublas_bmm_bprop_dB(
         N));
 }
 
+// Time a device operation after an explicit warmup and synchronization phase.
 template <typename Fn>
 float time_op(Fn&& fn, int warmup, int iters) {
     for (int i = 0; i < warmup; ++i) {
@@ -161,6 +170,8 @@ float time_op(Fn&& fn, int warmup, int iters) {
     return ms / static_cast<float>(iters);
 }
 
+// Run one logical BMM case end-to-end: allocate buffers, compare against
+// cuBLAS for correctness, then measure custom and library timings.
 CaseResult run_case(const Case& tc, int warmup, int iters, float eps) {
     const size_t a_elems = static_cast<size_t>(tc.N) * tc.W * tc.C;
     const size_t b_elems = static_cast<size_t>(tc.N) * tc.H * tc.C;
@@ -208,6 +219,9 @@ CaseResult run_case(const Case& tc, int warmup, int iters, float eps) {
     cublasHandle_t handle = nullptr;
     CUBLAS_CHECK(cublasCreate(&handle));
 
+    // These lambdas mirror the three logical operations used by the project:
+    // forward output, gradient w.r.t. the left operand, and gradient w.r.t.
+    // the right operand.
     auto custom_fprop = [&]() {
         bmm_matmul(dA, dB, dCustomY, tc.N, tc.W, tc.H, tc.C,
                    BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_YES);
@@ -259,6 +273,8 @@ CaseResult run_case(const Case& tc, int warmup, int iters, float eps) {
         throw std::runtime_error(oss.str());
     }
 
+    // Timings are collected only after correctness passes so the benchmark
+    // output always corresponds to a validated implementation.
     result.fprop.custom_ms = time_op(custom_fprop, warmup, iters);
     result.fprop.cublas_ms = time_op(ref_fprop, warmup, iters);
     result.bprop_dA.custom_ms = time_op(custom_dA, warmup, iters);
@@ -307,6 +323,8 @@ int main(int argc, char** argv) {
         const std::vector<Case> cases = default_cases();
         bool matched = only_case.empty();
 
+        // Keep output machine-readable enough for CI logs while still showing
+        // the key correctness and timing numbers per case.
         std::cout << std::fixed << std::setprecision(3);
         for (const Case& tc : cases) {
             if (!only_case.empty() && only_case != tc.name) {

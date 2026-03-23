@@ -730,6 +730,7 @@ void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
     }
 
     float* d_wg = ws.d_wg_all + static_cast<size_t>(g) * ncol * kdim;
+    // Forward GEMM: [m, kdim] @ [ncol, kdim]^T -> [m, ncol]
     bmm_matmul(d_col, d_wg, d_ymat, 1, m, ncol, kdim, BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_YES);
 
     int total_ym = m * ncol;
@@ -775,6 +776,7 @@ void launch_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
     pack_nhwc_group_matrix_kernel<<<blocks_dy, t>>>(d_dy, d_dy_mat, n, sh.ho, sh.wo, k, kout_base, sh.kout_group);
 
     float* d_wg = ws.d_wg_all + static_cast<size_t>(g) * ncol * kdim;
+    // Input-gradient GEMM: [m, ncol] @ [ncol, kdim] -> [m, kdim]
     bmm_matmul(d_dy_mat, d_wg, d_dcol, 1, m, kdim, ncol, BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_NONE);
 
     int total_dcol = m * kdim;
@@ -864,6 +866,7 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
     int blocks_dy = (total_dy + t - 1) / t;
     pack_nhwc_group_matrix_kernel<<<blocks_dy, t>>>(d_dy, d_dy_mat, n, sh.ho, sh.wo, k, kout_base, sh.kout_group);
 
+    // Weight-gradient GEMM: [m, kdim]^T @ [m, ncol] -> [kdim, ncol]
     bmm_matmul(d_col, d_dy_mat, d_dwg, 1, kdim, ncol, m, BMM_TRANSPOSE_YES, BMM_TRANSPOSE_NONE);
 
     int total_wg = kdim * ncol;

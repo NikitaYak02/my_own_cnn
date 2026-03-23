@@ -5,18 +5,25 @@ extern "C" {
 #endif
 
 /*
- * Row-major batched matrix multiplication.
+ * Row-major batched matrix multiplication used by both the standalone BMM
+ * benchmarks/tests and the convolution code paths.
  *
- * Computes, for each batch item:
- *   C[M, N] = op(A)[M, K] @ op(B)[K, N]
+ * For each batch item b the function computes:
+ *   C_b[M, N] = op(A_b)[M, K] @ op(B_b)[K, N]
  *
- * Layout conventions:
- *   trans_a == 0: A is stored as [M, K]
- *   trans_a != 0: A is stored as [K, M] and read as A^T
- *   trans_b == 0: B is stored as [K, N]
- *   trans_b != 0: B is stored as [N, K] and read as B^T
+ * Memory layout conventions:
+ *   trans_a == BMM_TRANSPOSE_NONE: A is stored as [batch, M, K]
+ *   trans_a == BMM_TRANSPOSE_YES:  A is stored as [batch, K, M] and read as A^T
+ *   trans_b == BMM_TRANSPOSE_NONE: B is stored as [batch, K, N]
+ *   trans_b == BMM_TRANSPOSE_YES:  B is stored as [batch, N, K] and read as B^T
  *
- * All pointers must reside in device memory.
+ * Logical dimensions:
+ *   batch - number of matrices in the batch
+ *   M     - number of output rows
+ *   N     - number of output columns
+ *   K     - reduction dimension shared by A and B
+ *
+ * All pointers must point to device memory containing float32 tensors.
  */
 
 enum BmmTranspose {

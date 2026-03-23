@@ -54,6 +54,13 @@ add_executable(bmm_test
 configure_cuda_target(bmm_test)
 target_link_libraries(bmm_test PRIVATE CUDA::cublas)
 
+add_executable(arcface_test
+  arcface.cu
+  arcface_test.cu
+)
+
+configure_cuda_target(arcface_test)
+
 if(ENABLE_CUDNN)
   find_path(CUDNN_INCLUDE_DIR cudnn.h
     HINTS
@@ -104,4 +111,7 @@ if(BUILD_TESTING)
     bmm_test_tall_256x64x256
     PROPERTIES LABELS "bmm"
   )
+
+  add_test(NAME arcface_test COMMAND arcface_test)
+  set_tests_properties(arcface_test PROPERTIES LABELS "arcface")
 endif()
