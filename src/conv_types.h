@@ -117,16 +117,13 @@ void cpu_grad_nhwc(const TensorNHWC& x, const TensorNHWC& dy, const Conv2DParams
 
 void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
                        int n, int h, int w, int c, int r, int s, int k,
-                       const Conv2DParams& p,
-                       bool use_implicit_precomp = false);
+                       const Conv2DParams& p);
 void launch_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
                        int n, int h, int w, int c, int r, int s, int k,
-                       const Conv2DParams& p,
-                       bool use_implicit_precomp = false);
+                       const Conv2DParams& p);
 void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                       int n, int h, int w, int c, int r, int s, int k,
-                      const Conv2DParams& p,
-                      bool use_implicit_precomp = false);
+                      const Conv2DParams& p);
 
 VerifyResult verify_tensors(const std::vector<float>& ref, const std::vector<float>& got, float abs_eps, float rel_eps);
 

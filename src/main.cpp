@@ -81,7 +81,7 @@ Options parse_args(int argc, char** argv) {
       std::cout
           << "conv_bench options:\n"
           << "  --op fprop|bprop|grad|all\n"
-          << "  --custom_mode explicit|implicit_precomp\n"
+          << "  --custom_mode explicit\n"
           << "  --n --h --w --c --k --r --s\n"
           << "  --pad_h --pad_w --stride_h --stride_w --dilation_h --dilation_w --groups\n"
           << "  --warmup --iters --seed\n"
@@ -208,8 +208,7 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
   const bool do_bprop = (o.op == "bprop" || o.op == "all");
   const bool do_grad = (o.op == "grad" || o.op == "all");
   ensure(do_fprop || do_bprop || do_grad, "--op must be fprop|bprop|grad|all");
-  const bool use_implicit_precomp = (o.custom_mode == "implicit_precomp");
-  ensure(use_implicit_precomp || o.custom_mode == "explicit", "--custom_mode must be explicit|implicit_precomp");
+  ensure(o.custom_mode == "explicit", "--custom_mode must be explicit");
 
   const size_t flops = conv_flops(bc.n, sh.ho, sh.wo, bc.r, bc.s, sh.cin_group, bc.k);
   std::cout << "\n[case] " << bc.name
@@ -223,7 +222,7 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
 
   if (do_fprop) {
     BenchResult b = benchmark_cuda_op("fprop", o.warmup, o.iters, flops, [&]() {
-      launch_fprop_nhwc(d_x, d_w, d_y, bc.n, bc.h, bc.w, bc.c, bc.r, bc.s, bc.k, p, use_implicit_precomp);
+      launch_fprop_nhwc(d_x, d_w, d_y, bc.n, bc.h, bc.w, bc.c, bc.r, bc.s, bc.k, p);
     });
     print_bench("custom fprop", b);
     if (o.with_cudnn) {
@@ -237,7 +236,7 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
 
   if (do_bprop) {
     BenchResult b = benchmark_cuda_op("bprop", o.warmup, o.iters, flops, [&]() {
-      launch_bprop_nhwc(d_dy, d_w, d_dx, bc.n, bc.h, bc.w, bc.c, bc.r, bc.s, bc.k, p, use_implicit_precomp);
+      launch_bprop_nhwc(d_dy, d_w, d_dx, bc.n, bc.h, bc.w, bc.c, bc.r, bc.s, bc.k, p);
     });
     print_bench("custom bprop", b);
     if (o.with_cudnn) {
@@ -251,7 +250,7 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
 
   if (do_grad) {
     BenchResult b = benchmark_cuda_op("grad", o.warmup, o.iters, flops, [&]() {
-      launch_grad_nhwc(d_x, d_dy, d_dw, bc.n, bc.h, bc.w, bc.c, bc.r, bc.s, bc.k, p, use_implicit_precomp);
+      launch_grad_nhwc(d_x, d_dy, d_dw, bc.n, bc.h, bc.w, bc.c, bc.r, bc.s, bc.k, p);
     });
     print_bench("custom grad", b);
     if (o.with_cudnn) {
