@@ -9,6 +9,31 @@
 #include <cudnn.h>
 #include <cudnn_cnn.h>
 
+void gather_input_block_nhwc(const float* d_src, float* d_dst,
+                             int n, int src_h, int src_w, int c,
+                             int hi_start, int wi_start,
+                             int local_h, int local_w);
+void gather_output_block_nhwc(const float* d_src, float* d_dst,
+                              int n, int src_h, int src_w, int c,
+                              int ho_start, int wo_start,
+                              int block_ho, int block_wo);
+void scatter_output_block_nhwc(const float* d_src, float* d_dst,
+                               int n, int dst_h, int dst_w, int c,
+                               int ho_start, int wo_start,
+                               int block_ho, int block_wo);
+void scatter_add_input_block_nhwc(const float* d_src, float* d_dst,
+                                  int n, int dst_h, int dst_w, int c,
+                                  int hi_start, int wi_start,
+                                  int local_h, int local_w);
+void gather_block_filter_to_krsc(const float* d_src, float* d_dst,
+                                 int by_count, int bx_count,
+                                 int r, int s, int cin_group, int k,
+                                 int block_y, int block_x);
+void scatter_block_filter_from_krsc(const float* d_src, float* d_dst,
+                                    int by_count, int bx_count,
+                                    int r, int s, int cin_group, int k,
+                                    int block_y, int block_x);
+
 namespace {
 
 void check_cudnn(cudnnStatus_t s, const char* stmt, const char* file, int line) {
@@ -100,6 +125,59 @@ const char* math_type_to_string(cudnnMathType_t math_type) {
     case CUDNN_FMA_MATH: return "CUDNN_FMA_MATH";
     default: return "CUDNN_MATH_UNKNOWN";
   }
+}
+
+struct BlockWindow {
+  int by = 0;
+  int bx = 0;
+  int ho_start = 0;
+  int wo_start = 0;
+  int hi_start = 0;
+  int wi_start = 0;
+};
+
+struct BlockBuffers {
+  float* d_x = nullptr;
+  float* d_w = nullptr;
+  float* d_y = nullptr;
+  float* d_dy = nullptr;
+  float* d_dx = nullptr;
+  float* d_dw = nullptr;
+};
+
+void free_block_buffers(std::vector<BlockBuffers>& blocks) {
+  for (BlockBuffers& block : blocks) {
+    cudaFree(block.d_x);
+    cudaFree(block.d_w);
+    cudaFree(block.d_y);
+    cudaFree(block.d_dy);
+    cudaFree(block.d_dx);
+    cudaFree(block.d_dw);
+    block = {};
+  }
+}
+
+std::vector<BlockWindow> enumerate_block_windows(const BlockConvShape& shape,
+                                                 const BlockConv2DParams& p,
+                                                 int r, int s) {
+  std::vector<BlockWindow> blocks;
+  blocks.reserve(static_cast<size_t>(p.block_by) * p.block_bx);
+  for (int by = 0; by < p.block_by; ++by) {
+    const int ho_start = by * shape.block_ho;
+    const int hi_start = ho_start * p.conv.stride_h - p.conv.pad_h;
+    for (int bx = 0; bx < p.block_bx; ++bx) {
+      const int wo_start = bx * shape.block_wo;
+      const int wi_start = wo_start * p.conv.stride_w - p.conv.pad_w;
+      blocks.push_back(BlockWindow{by, bx, ho_start, wo_start, hi_start, wi_start});
+    }
+  }
+  return blocks;
+}
+
+size_t blocked_conv_flops(int n, int block_ho, int block_wo,
+                          int by_count, int bx_count,
+                          int r, int s, int cin_group, int k) {
+  return static_cast<size_t>(2ULL) * n * block_ho * block_wo * by_count * bx_count * r * s * cin_group * k;
 }
 
 }  // namespace
@@ -239,6 +317,270 @@ BenchResult cudnn_grad_bench(const float* d_x, const float* d_dy, float* d_dw,
   return out;
 }
 
+BenchResult cudnn_block_fprop_bench(const float* d_x, const float* d_w, float* d_y,
+                                    int n, int h, int w, int c, int r, int s, int k,
+                                    const BlockConv2DParams& p,
+                                    int warmup, int iters) {
+  TensorNHWC xt(n, h, w, c);
+  BlockFilterKByBxRSC wt(k, p.block_by, p.block_bx, r, s, c / p.conv.groups);
+  const BlockConvShape sh = infer_block_conv_shape(xt, wt, p);
+  const int cin_group = c / p.conv.groups;
+  const int local_h = (sh.block_ho - 1) * p.conv.stride_h + (r - 1) * p.conv.dilation_h + 1;
+  const int local_w = (sh.block_wo - 1) * p.conv.stride_w + (s - 1) * p.conv.dilation_w + 1;
+  const int total_w = k * r * s * cin_group;
+  const size_t x_elems = static_cast<size_t>(n) * local_h * local_w * c;
+  const size_t y_elems = static_cast<size_t>(n) * sh.block_ho * sh.block_wo * k;
+  const std::vector<BlockWindow> windows = enumerate_block_windows(sh, p, r, s);
+
+  Conv2DParams local_p = p.conv;
+  local_p.pad_h = 0;
+  local_p.pad_w = 0;
+  TensorNHWC local_x_shape(n, local_h, local_w, c);
+  FilterKRSC local_w_shape(r, s, cin_group, k);
+  const ConvShape local_sh = infer_conv_shape(local_x_shape, local_w_shape, local_p);
+  if (local_sh.ho != sh.block_ho || local_sh.wo != sh.block_wo) {
+    throw std::runtime_error("blocked cuDNN fprop local shape mismatch");
+  }
+
+  CudnnHandle handle;
+  DescPack d;
+  setup_descs(d, n, local_h, local_w, c, r, s, k, local_p, sh.block_ho, sh.block_wo);
+
+  int returned = 0;
+  cudnnConvolutionFwdAlgoPerf_t perf{};
+  CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithm_v7(handle.h, d.x, d.w, d.conv, d.y, 1, &returned, &perf));
+  if (returned <= 0 || perf.status != CUDNN_STATUS_SUCCESS) {
+    throw std::runtime_error("cuDNN failed to select blocked forward algo");
+  }
+  cudnnConvolutionFwdAlgo_t algo = perf.algo;
+  size_t ws_size = 0;
+  CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(handle.h, d.x, d.w, d.conv, d.y, algo, &ws_size));
+  void* ws = nullptr;
+  if (ws_size) CUDA_CHECK(cudaMalloc(&ws, ws_size));
+
+  std::vector<BlockBuffers> blocks(windows.size());
+  for (size_t i = 0; i < windows.size(); ++i) {
+    const BlockWindow& window = windows[i];
+    CUDA_CHECK(cudaMalloc(&blocks[i].d_x, x_elems * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&blocks[i].d_w, static_cast<size_t>(total_w) * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&blocks[i].d_y, y_elems * sizeof(float)));
+
+    gather_input_block_nhwc(d_x, blocks[i].d_x, n, h, w, c,
+                            window.hi_start, window.wi_start,
+                            local_h, local_w);
+    gather_block_filter_to_krsc(d_w, blocks[i].d_w,
+                                p.block_by, p.block_bx,
+                                r, s, cin_group, k,
+                                window.by, window.bx);
+  }
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  auto fn = [&]() {
+    for (const BlockBuffers& block : blocks) {
+      CUDNN_CHECK(cudnnConvolutionForward(handle.h, &alpha,
+                                          d.x, block.d_x,
+                                          d.w, block.d_w,
+                                          d.conv, algo,
+                                          ws, ws_size,
+                                          &beta,
+                                          d.y, block.d_y));
+    }
+  };
+
+  BenchResult out = run_bench(blocked_conv_flops(n, sh.block_ho, sh.block_wo, p.block_by, p.block_bx, r, s, cin_group, k),
+                              warmup, iters, fn);
+
+  for (size_t i = 0; i < windows.size(); ++i) {
+    const BlockWindow& window = windows[i];
+    scatter_output_block_nhwc(blocks[i].d_y, d_y,
+                              n, sh.base.ho, sh.base.wo, k,
+                              window.ho_start, window.wo_start,
+                              sh.block_ho, sh.block_wo);
+  }
+
+  free_block_buffers(blocks);
+  if (ws) CUDA_CHECK(cudaFree(ws));
+  return out;
+}
+
+BenchResult cudnn_block_bprop_bench(const float* d_dy, const float* d_w, float* d_dx,
+                                    int n, int h, int w, int c, int r, int s, int k,
+                                    const BlockConv2DParams& p,
+                                    int warmup, int iters) {
+  TensorNHWC xt(n, h, w, c);
+  BlockFilterKByBxRSC wt(k, p.block_by, p.block_bx, r, s, c / p.conv.groups);
+  const BlockConvShape sh = infer_block_conv_shape(xt, wt, p);
+  const int cin_group = c / p.conv.groups;
+  const int local_h = (sh.block_ho - 1) * p.conv.stride_h + (r - 1) * p.conv.dilation_h + 1;
+  const int local_w = (sh.block_wo - 1) * p.conv.stride_w + (s - 1) * p.conv.dilation_w + 1;
+  const int total_w = k * r * s * cin_group;
+  const size_t dy_elems = static_cast<size_t>(n) * sh.block_ho * sh.block_wo * k;
+  const size_t dx_elems = static_cast<size_t>(n) * local_h * local_w * c;
+  const std::vector<BlockWindow> windows = enumerate_block_windows(sh, p, r, s);
+
+  Conv2DParams local_p = p.conv;
+  local_p.pad_h = 0;
+  local_p.pad_w = 0;
+  TensorNHWC local_x_shape(n, local_h, local_w, c);
+  FilterKRSC local_w_shape(r, s, cin_group, k);
+  const ConvShape local_sh = infer_conv_shape(local_x_shape, local_w_shape, local_p);
+  if (local_sh.ho != sh.block_ho || local_sh.wo != sh.block_wo) {
+    throw std::runtime_error("blocked cuDNN bprop local shape mismatch");
+  }
+
+  CudnnHandle handle;
+  DescPack d;
+  setup_descs(d, n, local_h, local_w, c, r, s, k, local_p, sh.block_ho, sh.block_wo);
+
+  int returned = 0;
+  cudnnConvolutionBwdDataAlgoPerf_t perf{};
+  CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm_v7(handle.h, d.w, d.dy, d.conv, d.dx, 1, &returned, &perf));
+  if (returned <= 0 || perf.status != CUDNN_STATUS_SUCCESS) {
+    throw std::runtime_error("cuDNN failed to select blocked backward-data algo");
+  }
+  cudnnConvolutionBwdDataAlgo_t algo = perf.algo;
+  size_t ws_size = 0;
+  CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(handle.h, d.w, d.dy, d.conv, d.dx, algo, &ws_size));
+  void* ws = nullptr;
+  if (ws_size) CUDA_CHECK(cudaMalloc(&ws, ws_size));
+
+  std::vector<BlockBuffers> blocks(windows.size());
+  for (size_t i = 0; i < windows.size(); ++i) {
+    const BlockWindow& window = windows[i];
+    CUDA_CHECK(cudaMalloc(&blocks[i].d_w, static_cast<size_t>(total_w) * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&blocks[i].d_dy, dy_elems * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&blocks[i].d_dx, dx_elems * sizeof(float)));
+
+    gather_output_block_nhwc(d_dy, blocks[i].d_dy,
+                             n, sh.base.ho, sh.base.wo, k,
+                             window.ho_start, window.wo_start,
+                             sh.block_ho, sh.block_wo);
+    gather_block_filter_to_krsc(d_w, blocks[i].d_w,
+                                p.block_by, p.block_bx,
+                                r, s, cin_group, k,
+                                window.by, window.bx);
+  }
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  auto fn = [&]() {
+    for (const BlockBuffers& block : blocks) {
+      CUDNN_CHECK(cudnnConvolutionBackwardData(handle.h, &alpha,
+                                               d.w, block.d_w,
+                                               d.dy, block.d_dy,
+                                               d.conv, algo,
+                                               ws, ws_size,
+                                               &beta,
+                                               d.dx, block.d_dx));
+    }
+  };
+
+  BenchResult out = run_bench(blocked_conv_flops(n, sh.block_ho, sh.block_wo, p.block_by, p.block_bx, r, s, cin_group, k),
+                              warmup, iters, fn);
+
+  CUDA_CHECK(cudaMemset(d_dx, 0, static_cast<size_t>(n) * h * w * c * sizeof(float)));
+  for (size_t i = 0; i < windows.size(); ++i) {
+    const BlockWindow& window = windows[i];
+    scatter_add_input_block_nhwc(blocks[i].d_dx, d_dx,
+                                 n, h, w, c,
+                                 window.hi_start, window.wi_start,
+                                 local_h, local_w);
+  }
+
+  free_block_buffers(blocks);
+  if (ws) CUDA_CHECK(cudaFree(ws));
+  return out;
+}
+
+BenchResult cudnn_block_grad_bench(const float* d_x, const float* d_dy, float* d_dw,
+                                   int n, int h, int w, int c, int r, int s, int k,
+                                   const BlockConv2DParams& p,
+                                   int warmup, int iters) {
+  TensorNHWC xt(n, h, w, c);
+  BlockFilterKByBxRSC wt(k, p.block_by, p.block_bx, r, s, c / p.conv.groups);
+  const BlockConvShape sh = infer_block_conv_shape(xt, wt, p);
+  const int cin_group = c / p.conv.groups;
+  const int local_h = (sh.block_ho - 1) * p.conv.stride_h + (r - 1) * p.conv.dilation_h + 1;
+  const int local_w = (sh.block_wo - 1) * p.conv.stride_w + (s - 1) * p.conv.dilation_w + 1;
+  const int total_w = k * r * s * cin_group;
+  const size_t x_elems = static_cast<size_t>(n) * local_h * local_w * c;
+  const size_t dy_elems = static_cast<size_t>(n) * sh.block_ho * sh.block_wo * k;
+  const std::vector<BlockWindow> windows = enumerate_block_windows(sh, p, r, s);
+
+  Conv2DParams local_p = p.conv;
+  local_p.pad_h = 0;
+  local_p.pad_w = 0;
+  TensorNHWC local_x_shape(n, local_h, local_w, c);
+  FilterKRSC local_w_shape(r, s, cin_group, k);
+  const ConvShape local_sh = infer_conv_shape(local_x_shape, local_w_shape, local_p);
+  if (local_sh.ho != sh.block_ho || local_sh.wo != sh.block_wo) {
+    throw std::runtime_error("blocked cuDNN grad local shape mismatch");
+  }
+
+  CudnnHandle handle;
+  DescPack d;
+  setup_descs(d, n, local_h, local_w, c, r, s, k, local_p, sh.block_ho, sh.block_wo);
+
+  int returned = 0;
+  cudnnConvolutionBwdFilterAlgoPerf_t perf{};
+  CUDNN_CHECK(cudnnGetConvolutionBackwardFilterAlgorithm_v7(handle.h, d.x, d.dy, d.conv, d.dw, 1, &returned, &perf));
+  if (returned <= 0 || perf.status != CUDNN_STATUS_SUCCESS) {
+    throw std::runtime_error("cuDNN failed to select blocked backward-filter algo");
+  }
+  cudnnConvolutionBwdFilterAlgo_t algo = perf.algo;
+  size_t ws_size = 0;
+  CUDNN_CHECK(cudnnGetConvolutionBackwardFilterWorkspaceSize(handle.h, d.x, d.dy, d.conv, d.dw, algo, &ws_size));
+  void* ws = nullptr;
+  if (ws_size) CUDA_CHECK(cudaMalloc(&ws, ws_size));
+
+  std::vector<BlockBuffers> blocks(windows.size());
+  for (size_t i = 0; i < windows.size(); ++i) {
+    const BlockWindow& window = windows[i];
+    CUDA_CHECK(cudaMalloc(&blocks[i].d_x, x_elems * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&blocks[i].d_dy, dy_elems * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&blocks[i].d_dw, static_cast<size_t>(total_w) * sizeof(float)));
+
+    gather_input_block_nhwc(d_x, blocks[i].d_x, n, h, w, c,
+                            window.hi_start, window.wi_start,
+                            local_h, local_w);
+    gather_output_block_nhwc(d_dy, blocks[i].d_dy,
+                             n, sh.base.ho, sh.base.wo, k,
+                             window.ho_start, window.wo_start,
+                             sh.block_ho, sh.block_wo);
+  }
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  auto fn = [&]() {
+    for (BlockBuffers& block : blocks) {
+      CUDNN_CHECK(cudnnConvolutionBackwardFilter(handle.h, &alpha,
+                                                 d.x, block.d_x,
+                                                 d.dy, block.d_dy,
+                                                 d.conv, algo,
+                                                 ws, ws_size,
+                                                 &beta,
+                                                 d.dw, block.d_dw));
+    }
+  };
+
+  BenchResult out = run_bench(blocked_conv_flops(n, sh.block_ho, sh.block_wo, p.block_by, p.block_bx, r, s, cin_group, k),
+                              warmup, iters, fn);
+
+  CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(k) * p.block_by * p.block_bx * r * s * cin_group * sizeof(float)));
+  for (size_t i = 0; i < windows.size(); ++i) {
+    const BlockWindow& window = windows[i];
+    scatter_block_filter_from_krsc(blocks[i].d_dw, d_dw,
+                                   p.block_by, p.block_bx,
+                                   r, s, cin_group, k,
+                                   window.by, window.bx);
+  }
+
+  free_block_buffers(blocks);
+  if (ws) CUDA_CHECK(cudaFree(ws));
+  return out;
+}
+
 #else
 
 bool cudnn_is_available() { return false; }
@@ -261,6 +603,27 @@ BenchResult cudnn_grad_bench(const float*, const float*, float*,
                              int, int, int, int, int, int, int,
                              const Conv2DParams&,
                              int, int) {
+  throw std::runtime_error("cuDNN support is not compiled in");
+}
+
+BenchResult cudnn_block_fprop_bench(const float*, const float*, float*,
+                                    int, int, int, int, int, int, int,
+                                    const BlockConv2DParams&,
+                                    int, int) {
+  throw std::runtime_error("cuDNN support is not compiled in");
+}
+
+BenchResult cudnn_block_bprop_bench(const float*, const float*, float*,
+                                    int, int, int, int, int, int, int,
+                                    const BlockConv2DParams&,
+                                    int, int) {
+  throw std::runtime_error("cuDNN support is not compiled in");
+}
+
+BenchResult cudnn_block_grad_bench(const float*, const float*, float*,
+                                   int, int, int, int, int, int, int,
+                                   const BlockConv2DParams&,
+                                   int, int) {
   throw std::runtime_error("cuDNN support is not compiled in");
 }
 
