@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -63,6 +65,13 @@ void bmm_bprop(
     const float* A, const float* B, const float* dY,
     float* dA, float* dB,
     int N, int W, int H, int C);
+
+#ifdef __cplusplus
+void bmm_matmul_i32(
+    const int32_t* A, const int32_t* B, int32_t* C,
+    int batch, int M, int N, int K,
+    int trans_a, int trans_b);
+#endif
 
 #ifdef __cplusplus
 }

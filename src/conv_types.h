@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "nnalgebra_quantization.h"
+
 #ifndef __CUDACC__
 #ifndef __host__
 #define __host__
@@ -83,6 +85,23 @@ struct BlockFilterKByBxRSC {
   size_t elements() const { return static_cast<size_t>(k) * by * bx * r * s * cin_per_group; }
   float* ptr() { return data.data(); }
   const float* ptr() const { return data.data(); }
+};
+
+struct TensorNHWCI32 {
+  int n = 0;
+  int h = 0;
+  int w = 0;
+  int c = 0;
+  std::vector<int32_t> data;
+
+  TensorNHWCI32() = default;
+  TensorNHWCI32(int n_, int h_, int w_, int c_)
+      : n(n_), h(h_), w(w_), c(c_),
+        data(static_cast<size_t>(n_) * h_ * w_ * c_) {}
+
+  size_t elements() const { return static_cast<size_t>(n) * h * w * c; }
+  int32_t* ptr() { return data.data(); }
+  const int32_t* ptr() const { return data.data(); }
 };
 
 struct ConvShape {
@@ -178,6 +197,80 @@ void cpu_block_fprop_nhwc(const TensorNHWC& x, const BlockFilterKByBxRSC& w, con
 void cpu_block_bprop_nhwc(const TensorNHWC& dy, const BlockFilterKByBxRSC& w, const BlockConv2DParams& p, TensorNHWC& dx);
 void cpu_block_grad_nhwc(const TensorNHWC& x, const TensorNHWC& dy, const BlockConv2DParams& p, BlockFilterKByBxRSC& dw);
 
+namespace conv_quant_detail {
+
+void cpu_fprop_nhwc_qi32_u8(const TensorNHWC& x, const FilterKRSC& w, const Conv2DParams& p,
+                            TensorNHWCI32& y,
+                            const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* in_qp,
+                            const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* f_qp);
+void cpu_fprop_nhwc_qi32_s5(const TensorNHWC& x, const FilterKRSC& w, const Conv2DParams& p,
+                            TensorNHWCI32& y,
+                            const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* in_qp,
+                            const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* f_qp);
+void cpu_block_fprop_nhwc_qi32_u8(const TensorNHWC& x, const BlockFilterKByBxRSC& w, const BlockConv2DParams& p,
+                                  TensorNHWCI32& y,
+                                  const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* in_qp,
+                                  const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* f_qp);
+void cpu_block_fprop_nhwc_qi32_s5(const TensorNHWC& x, const BlockFilterKByBxRSC& w, const BlockConv2DParams& p,
+                                  TensorNHWCI32& y,
+                                  const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* in_qp,
+                                  const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* f_qp);
+
+void launch_fprop_nhwc_qi32_u8(const float* d_x, const float* d_w, int32_t* d_y,
+                               int n, int h, int w, int c, int r, int s, int k,
+                               const Conv2DParams& p,
+                               const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* in_qp,
+                               const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* f_qp);
+void launch_fprop_nhwc_qi32_s5(const float* d_x, const float* d_w, int32_t* d_y,
+                               int n, int h, int w, int c, int r, int s, int k,
+                               const Conv2DParams& p,
+                               const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* in_qp,
+                               const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* f_qp);
+void launch_block_fprop_nhwc_qi32_u8(const float* d_x, const float* d_w, int32_t* d_y,
+                                     int n, int h, int w, int c, int r, int s, int k,
+                                     const BlockConv2DParams& p,
+                                     const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* in_qp,
+                                     const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* f_qp);
+void launch_block_fprop_nhwc_qi32_s5(const float* d_x, const float* d_w, int32_t* d_y,
+                                     int n, int h, int w, int c, int r, int s, int k,
+                                     const BlockConv2DParams& p,
+                                     const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* in_qp,
+                                     const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* f_qp);
+
+}  // namespace conv_quant_detail
+
+template <nnalgebra::DataType Tin>
+inline void cpu_fprop_nhwc_qi32(const TensorNHWC& x, const FilterKRSC& w, const Conv2DParams& p,
+                                TensorNHWCI32& y,
+                                const nnalgebra::QuantizationParameters<Tin>* in_qp,
+                                const nnalgebra::QuantizationParameters<Tin>* f_qp) {
+  static_assert(nnalgebra::kIsSupportedQuantizedInput<Tin>,
+                "cpu_fprop_nhwc_qi32 supports only LinQuantU8 and LinQuantS5");
+  if (!in_qp || !f_qp) throw std::runtime_error("quantized CPU fprop requires non-null quantization parameters");
+
+  if constexpr (Tin == nnalgebra::DataType::LinQuantU8) {
+    conv_quant_detail::cpu_fprop_nhwc_qi32_u8(x, w, p, y, in_qp, f_qp);
+  } else {
+    conv_quant_detail::cpu_fprop_nhwc_qi32_s5(x, w, p, y, in_qp, f_qp);
+  }
+}
+
+template <nnalgebra::DataType Tin>
+inline void cpu_block_fprop_nhwc_qi32(const TensorNHWC& x, const BlockFilterKByBxRSC& w, const BlockConv2DParams& p,
+                                      TensorNHWCI32& y,
+                                      const nnalgebra::QuantizationParameters<Tin>* in_qp,
+                                      const nnalgebra::QuantizationParameters<Tin>* f_qp) {
+  static_assert(nnalgebra::kIsSupportedQuantizedInput<Tin>,
+                "cpu_block_fprop_nhwc_qi32 supports only LinQuantU8 and LinQuantS5");
+  if (!in_qp || !f_qp) throw std::runtime_error("quantized blocked CPU fprop requires non-null quantization parameters");
+
+  if constexpr (Tin == nnalgebra::DataType::LinQuantU8) {
+    conv_quant_detail::cpu_block_fprop_nhwc_qi32_u8(x, w, p, y, in_qp, f_qp);
+  } else {
+    conv_quant_detail::cpu_block_fprop_nhwc_qi32_s5(x, w, p, y, in_qp, f_qp);
+  }
+}
+
 void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
                        int n, int h, int w, int c, int r, int s, int k,
                        const Conv2DParams& p);
@@ -196,6 +289,40 @@ void launch_block_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
 void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                             int n, int h, int w, int c, int r, int s, int k,
                             const BlockConv2DParams& p);
+
+template <nnalgebra::DataType Tin>
+inline void launch_fprop_nhwc_qi32(const float* d_x, const float* d_w, int32_t* d_y,
+                                   int n, int h, int w, int c, int r, int s, int k,
+                                   const Conv2DParams& p,
+                                   const nnalgebra::QuantizationParameters<Tin>* in_qp,
+                                   const nnalgebra::QuantizationParameters<Tin>* f_qp) {
+  static_assert(nnalgebra::kIsSupportedQuantizedInput<Tin>,
+                "launch_fprop_nhwc_qi32 supports only LinQuantU8 and LinQuantS5");
+  if (!in_qp || !f_qp) throw std::runtime_error("quantized CUDA fprop requires non-null quantization parameters");
+
+  if constexpr (Tin == nnalgebra::DataType::LinQuantU8) {
+    conv_quant_detail::launch_fprop_nhwc_qi32_u8(d_x, d_w, d_y, n, h, w, c, r, s, k, p, in_qp, f_qp);
+  } else {
+    conv_quant_detail::launch_fprop_nhwc_qi32_s5(d_x, d_w, d_y, n, h, w, c, r, s, k, p, in_qp, f_qp);
+  }
+}
+
+template <nnalgebra::DataType Tin>
+inline void launch_block_fprop_nhwc_qi32(const float* d_x, const float* d_w, int32_t* d_y,
+                                         int n, int h, int w, int c, int r, int s, int k,
+                                         const BlockConv2DParams& p,
+                                         const nnalgebra::QuantizationParameters<Tin>* in_qp,
+                                         const nnalgebra::QuantizationParameters<Tin>* f_qp) {
+  static_assert(nnalgebra::kIsSupportedQuantizedInput<Tin>,
+                "launch_block_fprop_nhwc_qi32 supports only LinQuantU8 and LinQuantS5");
+  if (!in_qp || !f_qp) throw std::runtime_error("quantized blocked CUDA fprop requires non-null quantization parameters");
+
+  if constexpr (Tin == nnalgebra::DataType::LinQuantU8) {
+    conv_quant_detail::launch_block_fprop_nhwc_qi32_u8(d_x, d_w, d_y, n, h, w, c, r, s, k, p, in_qp, f_qp);
+  } else {
+    conv_quant_detail::launch_block_fprop_nhwc_qi32_s5(d_x, d_w, d_y, n, h, w, c, r, s, k, p, in_qp, f_qp);
+  }
+}
 
 VerifyResult verify_tensors(const std::vector<float>& ref, const std::vector<float>& got, float abs_eps, float rel_eps);
 

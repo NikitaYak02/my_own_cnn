@@ -61,6 +61,16 @@ add_executable(arcface_test
 
 configure_cuda_target(arcface_test)
 
+add_executable(quant_conv_test
+  bmm.cu
+  quant_conv_test.cu
+  src/cpu_ref.cpp
+  src/cuda_kernels.cu
+  src/cuda_utils.cpp
+)
+
+configure_cuda_target(quant_conv_test)
+
 if(ENABLE_CUDNN)
   find_path(CUDNN_INCLUDE_DIR cudnn.h
     HINTS
@@ -114,4 +124,7 @@ if(BUILD_TESTING)
 
   add_test(NAME arcface_test COMMAND arcface_test)
   set_tests_properties(arcface_test PROPERTIES LABELS "arcface")
+
+  add_test(NAME quant_conv_test COMMAND quant_conv_test)
+  set_tests_properties(quant_conv_test PROPERTIES LABELS "quant_conv")
 endif()

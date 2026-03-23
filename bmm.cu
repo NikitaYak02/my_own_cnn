@@ -1,5 +1,6 @@
 #include "bmm.h"
 
+#include <cstdint>
 #include <cuda_runtime.h>
 #include <stdio.h>
 
@@ -151,6 +152,117 @@ static void launch_bmm_kernel(
     bmm_tiled_kernel<TRANS_A, TRANS_B><<<grid, block>>>(A, B, C, M, N, K);
 }
 
+template <bool TRANS_A, bool TRANS_B>
+__global__ void bmm_tiled_i32_kernel(
+    const int32_t* __restrict__ A,
+    const int32_t* __restrict__ B,
+    int32_t* __restrict__ C,
+    int M, int N, int K)
+{
+    const int batch_idx = blockIdx.z;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int tid = ty * blockDim.x + tx;
+
+    const int tile_row = blockIdx.y * kBlockRows;
+    const int tile_col = blockIdx.x * kBlockCols;
+    const int local_row = ty * kThreadRows;
+    const int local_col = tx * kThreadCols;
+    const int out_row0 = tile_row + local_row;
+    const int out_col0 = tile_col + local_col;
+
+    const int32_t* An = A + static_cast<size_t>(batch_idx) * M * K;
+    const int32_t* Bn = B + static_cast<size_t>(batch_idx) * K * N;
+    int32_t* Cn = C + static_cast<size_t>(batch_idx) * M * N;
+
+    __shared__ int32_t As[kBlockRows][kBlockDepth + kSharedPad];
+    __shared__ int32_t Bs[kBlockDepth][kBlockCols + kSharedPad];
+
+    int32_t acc[kThreadRows][kThreadCols] = {{0, 0}, {0, 0}};
+
+    for (int k0 = 0; k0 < K; k0 += kBlockDepth) {
+        if constexpr (TRANS_A) {
+            const int load_k = tid / kBlockRows;
+            const int load_m = tid % kBlockRows;
+            const int g_m = tile_row + load_m;
+            const int g_k = k0 + load_k;
+            As[load_m][load_k] =
+                (g_m < M && g_k < K) ? An[g_k * M + g_m] : 0;
+        } else {
+            const int load_m = tid / kBlockDepth;
+            const int load_k = tid % kBlockDepth;
+            const int g_m = tile_row + load_m;
+            const int g_k = k0 + load_k;
+            As[load_m][load_k] =
+                (g_m < M && g_k < K) ? An[g_m * K + g_k] : 0;
+        }
+
+        if constexpr (TRANS_B) {
+            const int load_n = tid / kBlockDepth;
+            const int load_k = tid % kBlockDepth;
+            const int g_n = tile_col + load_n;
+            const int g_k = k0 + load_k;
+            Bs[load_k][load_n] =
+                (g_n < N && g_k < K) ? Bn[g_n * K + g_k] : 0;
+        } else {
+            const int load_k = tid / kBlockCols;
+            const int load_n = tid % kBlockCols;
+            const int g_n = tile_col + load_n;
+            const int g_k = k0 + load_k;
+            Bs[load_k][load_n] =
+                (g_n < N && g_k < K) ? Bn[g_k * N + g_n] : 0;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < kBlockDepth; ++kk) {
+            const int32_t a0 = As[local_row + 0][kk];
+            const int32_t a1 = As[local_row + 1][kk];
+            const int32_t b0 = Bs[kk][local_col + 0];
+            const int32_t b1 = Bs[kk][local_col + 1];
+
+            acc[0][0] += a0 * b0;
+            acc[0][1] += a0 * b1;
+            acc[1][0] += a1 * b0;
+            acc[1][1] += a1 * b1;
+        }
+
+        __syncthreads();
+    }
+
+    for (int i = 0; i < kThreadRows; ++i) {
+        const int out_row = out_row0 + i;
+        if (out_row >= M) {
+            continue;
+        }
+        for (int j = 0; j < kThreadCols; ++j) {
+            const int out_col = out_col0 + j;
+            if (out_col < N) {
+                Cn[out_row * N + out_col] = acc[i][j];
+            }
+        }
+    }
+}
+
+template <bool TRANS_A, bool TRANS_B>
+static void launch_bmm_i32_kernel(
+    const int32_t* A,
+    const int32_t* B,
+    int32_t* C,
+    int batch,
+    int M,
+    int N,
+    int K)
+{
+    dim3 block(kBlockCols / kThreadCols, kBlockRows / kThreadRows);
+    dim3 grid((N + kBlockCols - 1) / kBlockCols,
+              (M + kBlockRows - 1) / kBlockRows,
+              batch);
+
+    bmm_tiled_i32_kernel<TRANS_A, TRANS_B><<<grid, block>>>(A, B, C, M, N, K);
+}
+
 /* ================================================================== */
 /*                          HOST  WRAPPERS                            */
 /* ================================================================== */
@@ -181,6 +293,32 @@ extern "C" void bmm_matmul(
     }
 
     launch_bmm_kernel<true, true>(A, B, C, batch, M, N, K);
+}
+
+extern "C" void bmm_matmul_i32(
+    const int32_t* A, const int32_t* B, int32_t* C,
+    int batch, int M, int N, int K,
+    int trans_a, int trans_b)
+{
+    const bool transpose_a = trans_a != 0;
+    const bool transpose_b = trans_b != 0;
+
+    if (!transpose_a && !transpose_b) {
+        launch_bmm_i32_kernel<false, false>(A, B, C, batch, M, N, K);
+        return;
+    }
+
+    if (!transpose_a && transpose_b) {
+        launch_bmm_i32_kernel<false, true>(A, B, C, batch, M, N, K);
+        return;
+    }
+
+    if (transpose_a && !transpose_b) {
+        launch_bmm_i32_kernel<true, false>(A, B, C, batch, M, N, K);
+        return;
+    }
+
+    launch_bmm_i32_kernel<true, true>(A, B, C, batch, M, N, K);
 }
 
 extern "C" void bmm_fprop(
