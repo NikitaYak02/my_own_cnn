@@ -18,7 +18,7 @@ find_package(CUDAToolkit REQUIRED)
 
 function(configure_cuda_target target_name)
   target_include_directories(${target_name} PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
-  target_link_libraries(${target_name} PRIVATE CUDA::cudart)
+  target_link_libraries(${target_name} PRIVATE CUDA::cudart CUDA::cublas)
   set_target_properties(${target_name} PROPERTIES
     CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}
     CUDA_SEPARABLE_COMPILATION ON
@@ -44,7 +44,6 @@ add_executable(bmm_bench
 )
 
 configure_cuda_target(bmm_bench)
-target_link_libraries(bmm_bench PRIVATE CUDA::cublas)
 
 add_executable(bmm_test
   bmm.cu
@@ -52,7 +51,6 @@ add_executable(bmm_test
 )
 
 configure_cuda_target(bmm_test)
-target_link_libraries(bmm_test PRIVATE CUDA::cublas)
 
 add_executable(arcface_test
   arcface.cu

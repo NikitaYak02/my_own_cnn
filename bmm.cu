@@ -1,6 +1,7 @@
 #include "bmm.h"
 
 #include <cstdint>
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <stdio.h>
 
@@ -18,6 +19,51 @@ constexpr int kSharedPad = 1;
 
 static_assert(kBlockRows % kThreadRows == 0, "row tile must divide block rows");
 static_assert(kBlockCols % kThreadCols == 0, "col tile must divide block cols");
+
+constexpr int kCublasTransposeAPathMinK = 2048;
+constexpr int kCublasTransposeAPathMaxOutput = 8192;
+
+static cublasHandle_t get_cublas_handle()
+{
+    static cublasHandle_t handle = nullptr;
+    static bool init = false;
+    if (!init) {
+        if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS) {
+            return nullptr;
+        }
+        cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
+        init = true;
+    }
+    return handle;
+}
+
+static bool launch_cublas_transpose_a_path(
+    const float* A, const float* B, float* C,
+    int batch, int M, int N, int K)
+{
+    cublasHandle_t handle = get_cublas_handle();
+    if (handle == nullptr) {
+        return false;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    // Row-major: C[M,N] = A[K,M]^T @ B[K,N]
+    // Column-major mapping used by cuBLAS:
+    // C_col[N,M] = B_col[N,K] @ A_col[M,K]^T
+    const cublasStatus_t st = cublasSgemmStridedBatched(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        N, M, K,
+        &alpha,
+        B, N, static_cast<long long>(K) * N,
+        A, M, static_cast<long long>(K) * M,
+        &beta,
+        C, N, static_cast<long long>(M) * N,
+        batch);
+
+    return st == CUBLAS_STATUS_SUCCESS;
+}
 
 }  // namespace
 
@@ -276,6 +322,15 @@ extern "C" void bmm_matmul(
     // with respect to data layout.
     const bool transpose_a = trans_a != 0;
     const bool transpose_b = trans_b != 0;
+
+    // cuBLAS path for transpose-A weight-gradient-like shapes:
+    // tiny output matrix, very large reduction dimension.
+    if (transpose_a && !transpose_b &&
+        M * N <= kCublasTransposeAPathMaxOutput &&
+        K >= kCublasTransposeAPathMinK &&
+        launch_cublas_transpose_a_path(A, B, C, batch, M, N, K)) {
+        return;
+    }
 
     if (!transpose_a && !transpose_b) {
         launch_bmm_kernel<false, false>(A, B, C, batch, M, N, K);
