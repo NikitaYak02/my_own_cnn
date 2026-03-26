@@ -190,6 +190,12 @@ struct BenchResult {
   float gflops = 0.0f;
 };
 
+enum class GradKernelAlgo {
+  GemmIm2Col = 0,
+  Algo0Atomic = 1,
+  Algo1Deterministic = 2,
+};
+
 void cpu_fprop_nhwc(const TensorNHWC& x, const FilterKRSC& w, const Conv2DParams& p, TensorNHWC& y);
 void cpu_bprop_nhwc(const TensorNHWC& dy, const FilterKRSC& w, const Conv2DParams& p, TensorNHWC& dx);
 void cpu_grad_nhwc(const TensorNHWC& x, const TensorNHWC& dy, const Conv2DParams& p, FilterKRSC& dw);
@@ -279,7 +285,8 @@ void launch_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
                        const Conv2DParams& p);
 void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                       int n, int h, int w, int c, int r, int s, int k,
-                      const Conv2DParams& p);
+                      const Conv2DParams& p,
+                      GradKernelAlgo algo = GradKernelAlgo::GemmIm2Col);
 void launch_block_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
                              int n, int h, int w, int c, int r, int s, int k,
                              const BlockConv2DParams& p);
@@ -288,7 +295,8 @@ void launch_block_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
                              const BlockConv2DParams& p);
 void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                             int n, int h, int w, int c, int r, int s, int k,
-                            const BlockConv2DParams& p);
+                            const BlockConv2DParams& p,
+                            GradKernelAlgo algo = GradKernelAlgo::GemmIm2Col);
 
 template <nnalgebra::DataType Tin>
 inline void launch_fprop_nhwc_qi32(const float* d_x, const float* d_w, int32_t* d_y,

@@ -15,6 +15,7 @@ namespace {
 struct Options {
   std::string op = "all";
   std::string custom_mode = "explicit";
+  std::string grad_algo = "gemm";
   int n = 32;
   int h = 56;
   int w = 56;
@@ -73,6 +74,30 @@ int parse_int(const std::string& v, const char* name) {
   }
 }
 
+GradKernelAlgo parse_grad_algo(const std::string& value) {
+  if (value == "gemm") return GradKernelAlgo::GemmIm2Col;
+  if (value == "algo0") return GradKernelAlgo::Algo0Atomic;
+  if (value == "algo1") return GradKernelAlgo::Algo1Deterministic;
+  throw std::runtime_error("invalid value for --grad_algo: " + value + " (expected gemm|algo0|algo1|all)");
+}
+
+const char* grad_algo_to_string(GradKernelAlgo algo) {
+  switch (algo) {
+    case GradKernelAlgo::GemmIm2Col: return "gemm";
+    case GradKernelAlgo::Algo0Atomic: return "algo0";
+    case GradKernelAlgo::Algo1Deterministic: return "algo1";
+    default: return "unknown";
+  }
+}
+
+std::vector<std::string> expand_grad_algo_names(const std::string& value) {
+  if (value == "all") {
+    return {"gemm", "algo0", "algo1"};
+  }
+  (void)parse_grad_algo(value);
+  return {value};
+}
+
 Options parse_args(int argc, char** argv) {
   Options o;
   for (int i = 1; i < argc; ++i) {
@@ -84,6 +109,7 @@ Options parse_args(int argc, char** argv) {
 
     if (a == "--op") o.op = need_val("--op");
     else if (a == "--custom_mode") o.custom_mode = need_val("--custom_mode");
+    else if (a == "--grad_algo") o.grad_algo = need_val("--grad_algo");
     else if (a == "--n") o.n = parse_int(need_val("--n"), "--n");
     else if (a == "--h") o.h = parse_int(need_val("--h"), "--h");
     else if (a == "--w") o.w = parse_int(need_val("--w"), "--w");
@@ -111,6 +137,7 @@ Options parse_args(int argc, char** argv) {
           << "conv_bench options:\n"
           << "  --op fprop|bprop|grad|all\n"
           << "  --custom_mode explicit|blocked\n"
+          << "  --grad_algo gemm|algo0|algo1|all\n"
           << "  --n --h --w --c --k --r --s\n"
           << "  --pad_h --pad_w --stride_h --stride_w --dilation_h --dilation_w --groups\n"
           << "  --block_by --block_bx\n"
@@ -160,6 +187,18 @@ float vec_max(std::vector<float> v) {
   return *std::max_element(v.begin(), v.end());
 }
 
+void push_ratio(std::vector<float>& out, float ratio) {
+  if (ratio > 0.0f) out.push_back(ratio);
+}
+
+void print_ratio_summary_line(const char* label, const std::vector<float>& ratios) {
+  if (ratios.empty()) return;
+  std::cout << label
+            << " min=" << std::fixed << std::setprecision(3) << vec_min(ratios)
+            << "x median=" << vec_median(ratios)
+            << "x max=" << vec_max(ratios) << "x\n";
+}
+
 std::vector<BenchCase> default_bench_suite() {
   return {
       {"resnet_like_56x56", 32, 56, 56, 64, 64, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1},
@@ -197,6 +236,7 @@ void print_verify(const std::string& tag, const VerifyResult& vr) {
 CaseRatios run_case(const Options& o, const BenchCase& bc) {
   const bool blocked = (o.custom_mode == "blocked");
   ensure(blocked || o.custom_mode == "explicit", "--custom_mode must be explicit|blocked");
+  const GradKernelAlgo grad_algo = parse_grad_algo(o.grad_algo);
 
   CaseRatios ratios;
   Conv2DParams p;
@@ -282,7 +322,8 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
             << " stride=" << bc.stride_h << "x" << bc.stride_w
             << " pad=" << bc.pad_h << "x" << bc.pad_w
             << " dilation=" << bc.dilation_h << "x" << bc.dilation_w
-            << " groups=" << bc.groups;
+            << " groups=" << bc.groups
+            << " grad_algo=" << grad_algo_to_string(grad_algo);
   if (blocked) {
     std::cout << " blocks=" << bp.block_by << "x" << bp.block_bx;
   }
@@ -382,9 +423,9 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
   if (do_grad) {
     BenchResult b = benchmark_cuda_op("grad", o.warmup, o.iters, flops, [&]() {
       if (blocked) {
-        launch_block_grad_nhwc(d_x, d_dy, d_dw, bc.n, bc.h, bc.w, bc.c, bc.r, bc.s, bc.k, bp);
+        launch_block_grad_nhwc(d_x, d_dy, d_dw, bc.n, bc.h, bc.w, bc.c, bc.r, bc.s, bc.k, bp, grad_algo);
       } else {
-        launch_grad_nhwc(d_x, d_dy, d_dw, bc.n, bc.h, bc.w, bc.c, bc.r, bc.s, bc.k, p);
+        launch_grad_nhwc(d_x, d_dy, d_dw, bc.n, bc.h, bc.w, bc.c, bc.r, bc.s, bc.k, p, grad_algo);
       }
     });
     print_bench("custom grad", b);
@@ -445,37 +486,83 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
 int main(int argc, char** argv) {
   try {
     const Options o = parse_args(argc, argv);
+    auto execute_cases = [&](const std::vector<BenchCase>& cases) {
+      const std::vector<std::string> grad_algo_names = expand_grad_algo_names(o.grad_algo);
+      const bool run_all_grad_algos = (grad_algo_names.size() > 1);
+
+      std::vector<float> fprop_ratios;
+      std::vector<float> bprop_ratios;
+      std::vector<float> grad_ratios_gemm;
+      std::vector<float> grad_ratios_algo0;
+      std::vector<float> grad_ratios_algo1;
+
+      auto append_grad_ratio = [&](const std::string& algo_name, float ratio) {
+        if (algo_name == "gemm") push_ratio(grad_ratios_gemm, ratio);
+        else if (algo_name == "algo0") push_ratio(grad_ratios_algo0, ratio);
+        else if (algo_name == "algo1") push_ratio(grad_ratios_algo1, ratio);
+      };
+
+      for (const BenchCase& bc : cases) {
+        if (run_all_grad_algos && o.op == "all") {
+          Options fprop_o = o;
+          fprop_o.op = "fprop";
+          fprop_o.grad_algo = "gemm";
+          push_ratio(fprop_ratios, run_case(fprop_o, bc).fprop);
+
+          Options bprop_o = o;
+          bprop_o.op = "bprop";
+          bprop_o.grad_algo = "gemm";
+          push_ratio(bprop_ratios, run_case(bprop_o, bc).bprop);
+
+          for (const std::string& algo_name : grad_algo_names) {
+            Options grad_o = o;
+            grad_o.op = "grad";
+            grad_o.grad_algo = algo_name;
+            append_grad_ratio(algo_name, run_case(grad_o, bc).grad);
+          }
+        } else if (run_all_grad_algos && o.op == "grad") {
+          for (const std::string& algo_name : grad_algo_names) {
+            Options grad_o = o;
+            grad_o.grad_algo = algo_name;
+            append_grad_ratio(algo_name, run_case(grad_o, bc).grad);
+          }
+        } else {
+          CaseRatios cr = run_case(o, bc);
+          push_ratio(fprop_ratios, cr.fprop);
+          push_ratio(bprop_ratios, cr.bprop);
+          if (!grad_algo_names.empty()) {
+            append_grad_ratio(grad_algo_names.front(), cr.grad);
+          }
+        }
+      }
+
+      if (o.with_cudnn) {
+        std::cout << "\n[summary] custom/cudnn ratio (lower is better)\n";
+        print_ratio_summary_line("fprop", fprop_ratios);
+        print_ratio_summary_line("bprop", bprop_ratios);
+        if (run_all_grad_algos) {
+          print_ratio_summary_line("grad[gemm]", grad_ratios_gemm);
+          print_ratio_summary_line("grad[algo0]", grad_ratios_algo0);
+          print_ratio_summary_line("grad[algo1]", grad_ratios_algo1);
+        } else if (!grad_algo_names.empty()) {
+          const std::string label = std::string("grad[") + grad_algo_names.front() + "]";
+          if (grad_algo_names.front() == "gemm") print_ratio_summary_line(label.c_str(), grad_ratios_gemm);
+          else if (grad_algo_names.front() == "algo0") print_ratio_summary_line(label.c_str(), grad_ratios_algo0);
+          else if (grad_algo_names.front() == "algo1") print_ratio_summary_line(label.c_str(), grad_ratios_algo1);
+        }
+      }
+    };
+
     if (o.bench_suite) {
       const bool blocked = (o.custom_mode == "blocked");
       const std::vector<BenchCase> suite = blocked ? default_blocked_bench_suite() : default_bench_suite();
-      std::cout << "Running benchmark suite (" << suite.size() << " cases)\n";
-      std::vector<float> fprop_ratios;
-      std::vector<float> bprop_ratios;
-      std::vector<float> grad_ratios;
-      for (const BenchCase& bc : suite) {
-        CaseRatios cr = run_case(o, bc);
-        if (cr.fprop > 0.0f) fprop_ratios.push_back(cr.fprop);
-        if (cr.bprop > 0.0f) bprop_ratios.push_back(cr.bprop);
-        if (cr.grad > 0.0f) grad_ratios.push_back(cr.grad);
+      const std::vector<std::string> grad_algo_names = expand_grad_algo_names(o.grad_algo);
+      std::cout << "Running benchmark suite (" << suite.size() << " cases";
+      if (grad_algo_names.size() > 1 && (o.op == "grad" || o.op == "all")) {
+        std::cout << ", grad algos=" << grad_algo_names.size();
       }
-      if (o.with_cudnn) {
-        std::cout << "\n[summary] custom/cudnn ratio (lower is better)\n";
-        if (!fprop_ratios.empty()) {
-          std::cout << "fprop min=" << std::fixed << std::setprecision(3) << vec_min(fprop_ratios)
-                    << "x median=" << vec_median(fprop_ratios)
-                    << "x max=" << vec_max(fprop_ratios) << "x\n";
-        }
-        if (!bprop_ratios.empty()) {
-          std::cout << "bprop min=" << std::fixed << std::setprecision(3) << vec_min(bprop_ratios)
-                    << "x median=" << vec_median(bprop_ratios)
-                    << "x max=" << vec_max(bprop_ratios) << "x\n";
-        }
-        if (!grad_ratios.empty()) {
-          std::cout << "grad min=" << std::fixed << std::setprecision(3) << vec_min(grad_ratios)
-                    << "x median=" << vec_median(grad_ratios)
-                    << "x max=" << vec_max(grad_ratios) << "x\n";
-        }
-      }
+      std::cout << ")\n";
+      execute_cases(suite);
     } else {
       BenchCase single{
           "single",
@@ -485,7 +572,7 @@ int main(int argc, char** argv) {
           o.dilation_h, o.dilation_w,
           o.groups,
           o.block_by, o.block_bx};
-      (void)run_case(o, single);
+      execute_cases({single});
     }
 
     return 0;

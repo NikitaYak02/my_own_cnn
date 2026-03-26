@@ -2,6 +2,7 @@
 #include "cuda_utils.h"
 #include "bmm.h"
 
+#include <algorithm>
 #include <cuda_runtime.h>
 
 namespace {
@@ -652,6 +653,215 @@ __global__ void col2im_accum_nhwc_kernel(const float* __restrict__ dcol,
   }
 }
 
+__global__ void grad_filter_algo0_nhwc_kernel(const float* __restrict__ x,
+                                              const float* __restrict__ dy,
+                                              float* __restrict__ dw,
+                                              int n, int h, int w, int c,
+                                              int ho, int wo,
+                                              int r, int s, int k,
+                                              int pad_h, int pad_w,
+                                              int stride_h, int stride_w,
+                                              int dilation_h, int dilation_w,
+                                              int cin_group, int kout_group) {
+  const size_t total = static_cast<size_t>(n) * ho * wo * k;
+  const size_t start = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+
+  for (size_t idx = start; idx < total; idx += stride) {
+    const int k_idx = static_cast<int>(idx % k);
+    const size_t row = idx / k;
+    const int n_idx = static_cast<int>(row / static_cast<size_t>(ho * wo));
+    const int rem = static_cast<int>(row % static_cast<size_t>(ho * wo));
+    const int ho_idx = rem / wo;
+    const int wo_idx = rem - ho_idx * wo;
+
+    const int group = k_idx / kout_group;
+    const int cin_base = group * cin_group;
+    const float dyv = dy[idx_nhwc(n_idx, ho_idx, wo_idx, k_idx, ho, wo, k)];
+
+    for (int rr = 0; rr < r; ++rr) {
+      const int hi = ho_idx * stride_h - pad_h + rr * dilation_h;
+      if (hi < 0 || hi >= h) continue;
+      for (int ss = 0; ss < s; ++ss) {
+        const int wi = wo_idx * stride_w - pad_w + ss * dilation_w;
+        if (wi < 0 || wi >= w) continue;
+        for (int ci = 0; ci < cin_group; ++ci) {
+          const float xv = x[idx_nhwc(n_idx, hi, wi, cin_base + ci, h, w, c)];
+          atomicAdd(&dw[idx_krsc(k_idx, rr, ss, ci, r, s, cin_group)], xv * dyv);
+        }
+      }
+    }
+  }
+}
+
+__global__ void grad_filter_algo1_nhwc_kernel(const float* __restrict__ x,
+                                              const float* __restrict__ dy,
+                                              float* __restrict__ dw,
+                                              int n, int h, int w, int c,
+                                              int ho, int wo,
+                                              int r, int s, int k,
+                                              int pad_h, int pad_w,
+                                              int stride_h, int stride_w,
+                                              int dilation_h, int dilation_w,
+                                              int cin_group, int kout_group) {
+  __shared__ float partial[256];
+
+  const int weight_idx = blockIdx.x;
+  const int ci = weight_idx % cin_group;
+  const int t0 = weight_idx / cin_group;
+  const int ss = t0 % s;
+  const int t1 = t0 / s;
+  const int rr = t1 % r;
+  const int k_idx = t1 / r;
+
+  const int group = k_idx / kout_group;
+  const int cin_base = group * cin_group;
+  const int m = n * ho * wo;
+
+  float sum = 0.0f;
+  for (int row = threadIdx.x; row < m; row += blockDim.x) {
+    const int n_idx = row / (ho * wo);
+    const int rem = row - n_idx * (ho * wo);
+    const int ho_idx = rem / wo;
+    const int wo_idx = rem - ho_idx * wo;
+
+    const int hi = ho_idx * stride_h - pad_h + rr * dilation_h;
+    const int wi = wo_idx * stride_w - pad_w + ss * dilation_w;
+    if (hi < 0 || hi >= h || wi < 0 || wi >= w) continue;
+
+    const float xv = x[idx_nhwc(n_idx, hi, wi, cin_base + ci, h, w, c)];
+    const float dyv = dy[idx_nhwc(n_idx, ho_idx, wo_idx, k_idx, ho, wo, k)];
+    sum += xv * dyv;
+  }
+
+  partial[threadIdx.x] = sum;
+  __syncthreads();
+
+  for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+    if (threadIdx.x < offset) {
+      partial[threadIdx.x] += partial[threadIdx.x + offset];
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    dw[idx_krsc(k_idx, rr, ss, ci, r, s, cin_group)] = partial[0];
+  }
+}
+
+__global__ void block_grad_filter_algo0_nhwc_kernel(const float* __restrict__ x,
+                                                    const float* __restrict__ dy,
+                                                    float* __restrict__ dw,
+                                                    int n, int h, int w, int c,
+                                                    int ho, int wo,
+                                                    int block_ho, int block_wo,
+                                                    int by_count, int bx_count,
+                                                    int r, int s, int k,
+                                                    int pad_h, int pad_w,
+                                                    int stride_h, int stride_w,
+                                                    int dilation_h, int dilation_w,
+                                                    int cin_group, int kout_group) {
+  const size_t total = static_cast<size_t>(n) * ho * wo * k;
+  const size_t start = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+
+  for (size_t idx = start; idx < total; idx += stride) {
+    const int k_idx = static_cast<int>(idx % k);
+    const size_t row = idx / k;
+    const int n_idx = static_cast<int>(row / static_cast<size_t>(ho * wo));
+    const int rem = static_cast<int>(row % static_cast<size_t>(ho * wo));
+    const int ho_idx = rem / wo;
+    const int wo_idx = rem - ho_idx * wo;
+
+    const int by = ho_idx / block_ho;
+    const int bx = wo_idx / block_wo;
+    const int group = k_idx / kout_group;
+    const int cin_base = group * cin_group;
+    const float dyv = dy[idx_nhwc(n_idx, ho_idx, wo_idx, k_idx, ho, wo, k)];
+
+    for (int rr = 0; rr < r; ++rr) {
+      const int hi = ho_idx * stride_h - pad_h + rr * dilation_h;
+      if (hi < 0 || hi >= h) continue;
+      for (int ss = 0; ss < s; ++ss) {
+        const int wi = wo_idx * stride_w - pad_w + ss * dilation_w;
+        if (wi < 0 || wi >= w) continue;
+        for (int ci = 0; ci < cin_group; ++ci) {
+          const float xv = x[idx_nhwc(n_idx, hi, wi, cin_base + ci, h, w, c)];
+          atomicAdd(&dw[idx_kbybxrsc(k_idx, by, bx, rr, ss, ci,
+                                     by_count, bx_count, r, s, cin_group)],
+                    xv * dyv);
+        }
+      }
+    }
+  }
+}
+
+__global__ void block_grad_filter_algo1_nhwc_kernel(const float* __restrict__ x,
+                                                    const float* __restrict__ dy,
+                                                    float* __restrict__ dw,
+                                                    int n, int h, int w, int c,
+                                                    int ho, int wo,
+                                                    int block_ho, int block_wo,
+                                                    int by_count, int bx_count,
+                                                    int r, int s, int k,
+                                                    int pad_h, int pad_w,
+                                                    int stride_h, int stride_w,
+                                                    int dilation_h, int dilation_w,
+                                                    int cin_group, int kout_group) {
+  __shared__ float partial[256];
+
+  const int weight_idx = blockIdx.x;
+  const int ci = weight_idx % cin_group;
+  const int t0 = weight_idx / cin_group;
+  const int ss = t0 % s;
+  const int t1 = t0 / s;
+  const int rr = t1 % r;
+  const int t2 = t1 / r;
+  const int bx = t2 % bx_count;
+  const int t3 = t2 / bx_count;
+  const int by = t3 % by_count;
+  const int k_idx = t3 / by_count;
+
+  const int group = k_idx / kout_group;
+  const int cin_base = group * cin_group;
+  const int m = n * block_ho * block_wo;
+  const int ho_start = by * block_ho;
+  const int wo_start = bx * block_wo;
+
+  float sum = 0.0f;
+  for (int row = threadIdx.x; row < m; row += blockDim.x) {
+    const int n_idx = row / (block_ho * block_wo);
+    const int rem = row - n_idx * (block_ho * block_wo);
+    const int lho = rem / block_wo;
+    const int lwo = rem - lho * block_wo;
+    const int ho_idx = ho_start + lho;
+    const int wo_idx = wo_start + lwo;
+
+    const int hi = ho_idx * stride_h - pad_h + rr * dilation_h;
+    const int wi = wo_idx * stride_w - pad_w + ss * dilation_w;
+    if (hi < 0 || hi >= h || wi < 0 || wi >= w) continue;
+
+    const float xv = x[idx_nhwc(n_idx, hi, wi, cin_base + ci, h, w, c)];
+    const float dyv = dy[idx_nhwc(n_idx, ho_idx, wo_idx, k_idx, ho, wo, k)];
+    sum += xv * dyv;
+  }
+
+  partial[threadIdx.x] = sum;
+  __syncthreads();
+
+  for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+    if (threadIdx.x < offset) {
+      partial[threadIdx.x] += partial[threadIdx.x + offset];
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    dw[idx_kbybxrsc(k_idx, by, bx, rr, ss, ci,
+                    by_count, bx_count, r, s, cin_group)] = partial[0];
+  }
+}
+
 }  // namespace
 
 void gather_input_block_nhwc(const float* d_src, float* d_dst,
@@ -839,10 +1049,42 @@ void launch_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
 
 void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                       int n, int h, int w, int c, int r, int s, int k,
-                      const Conv2DParams& p) {
+                      const Conv2DParams& p,
+                      GradKernelAlgo algo) {
   TensorNHWC x_shape(n, h, w, c);
   FilterKRSC w_shape(r, s, c / p.groups, k);
   ConvShape sh = infer_conv_shape(x_shape, w_shape, p);
+
+  if (algo == GradKernelAlgo::Algo0Atomic) {
+    CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(r) * s * sh.cin_group * k * sizeof(float)));
+    const size_t total = static_cast<size_t>(n) * sh.ho * sh.wo * k;
+    const int t = 256;
+    const int blocks = static_cast<int>(std::min<size_t>((total + t - 1) / t, 65535));
+    grad_filter_algo0_nhwc_kernel<<<blocks, t>>>(d_x, d_dy, d_dw,
+                                                 n, h, w, c,
+                                                 sh.ho, sh.wo,
+                                                 r, s, k,
+                                                 p.pad_h, p.pad_w,
+                                                 p.stride_h, p.stride_w,
+                                                 p.dilation_h, p.dilation_w,
+                                                 sh.cin_group, sh.kout_group);
+    CUDA_CHECK(cudaGetLastError());
+    return;
+  }
+
+  if (algo == GradKernelAlgo::Algo1Deterministic) {
+    const int total_weights = k * r * s * sh.cin_group;
+    grad_filter_algo1_nhwc_kernel<<<total_weights, 256>>>(d_x, d_dy, d_dw,
+                                                          n, h, w, c,
+                                                          sh.ho, sh.wo,
+                                                          r, s, k,
+                                                          p.pad_h, p.pad_w,
+                                                          p.stride_h, p.stride_w,
+                                                          p.dilation_h, p.dilation_w,
+                                                          sh.cin_group, sh.kout_group);
+    CUDA_CHECK(cudaGetLastError());
+    return;
+  }
 
   const int m = n * sh.ho * sh.wo;
   const int kdim = r * s * sh.cin_group;
@@ -1020,10 +1262,46 @@ void launch_block_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
 
 void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                             int n, int h, int w, int c, int r, int s, int k,
-                            const BlockConv2DParams& p) {
+                            const BlockConv2DParams& p,
+                            GradKernelAlgo algo) {
   TensorNHWC x_shape(n, h, w, c);
   BlockFilterKByBxRSC w_shape(k, p.block_by, p.block_bx, r, s, c / p.conv.groups);
   const BlockConvShape sh = infer_block_conv_shape(x_shape, w_shape, p);
+
+  if (algo == GradKernelAlgo::Algo0Atomic) {
+    CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(k) * p.block_by * p.block_bx * r * s * sh.base.cin_group * sizeof(float)));
+    const size_t total = static_cast<size_t>(n) * sh.base.ho * sh.base.wo * k;
+    const int t = 256;
+    const int blocks = static_cast<int>(std::min<size_t>((total + t - 1) / t, 65535));
+    block_grad_filter_algo0_nhwc_kernel<<<blocks, t>>>(d_x, d_dy, d_dw,
+                                                       n, h, w, c,
+                                                       sh.base.ho, sh.base.wo,
+                                                       sh.block_ho, sh.block_wo,
+                                                       p.block_by, p.block_bx,
+                                                       r, s, k,
+                                                       p.conv.pad_h, p.conv.pad_w,
+                                                       p.conv.stride_h, p.conv.stride_w,
+                                                       p.conv.dilation_h, p.conv.dilation_w,
+                                                       sh.base.cin_group, sh.base.kout_group);
+    CUDA_CHECK(cudaGetLastError());
+    return;
+  }
+
+  if (algo == GradKernelAlgo::Algo1Deterministic) {
+    const int total_weights = k * p.block_by * p.block_bx * r * s * sh.base.cin_group;
+    block_grad_filter_algo1_nhwc_kernel<<<total_weights, 256>>>(d_x, d_dy, d_dw,
+                                                                n, h, w, c,
+                                                                sh.base.ho, sh.base.wo,
+                                                                sh.block_ho, sh.block_wo,
+                                                                p.block_by, p.block_bx,
+                                                                r, s, k,
+                                                                p.conv.pad_h, p.conv.pad_w,
+                                                                p.conv.stride_h, p.conv.stride_w,
+                                                                p.conv.dilation_h, p.conv.dilation_w,
+                                                                sh.base.cin_group, sh.base.kout_group);
+    CUDA_CHECK(cudaGetLastError());
+    return;
+  }
 
   const int m_block = n * sh.block_ho * sh.block_wo;
   const int kdim = r * s * sh.base.cin_group;
