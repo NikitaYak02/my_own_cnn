@@ -15,7 +15,7 @@ endif()
 message(STATUS "Configuring CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "52")
-  message(WARNING "CUDA architecture 52 is a legacy target. Use a fresh build directory or one of the presets (sm86, sm89) for Ampere/Ada GPUs.")
+  message(WARNING "CUDA architecture 52 is a legacy target. Use a fresh build directory or one of the presets (sm86, sm89, linux-sm86-gcc, linux-sm89-gcc) for Ampere/Ada GPUs.")
 endif()
 
 option(ENABLE_CUDNN "Enable cuDNN benchmark/reference" ON)
@@ -89,8 +89,13 @@ set_target_properties(conv_grad_check PROPERTIES
 if(ENABLE_CUDNN)
   set(CUDNN_ROOT_HINTS
     $ENV{CUDNN_ROOT}
+    $ENV{CUDNN_HOME}
     "C:/Program Files/NVIDIA/CUDNN"
     "C:/Program Files/NVIDIA/CUDNN/v9.19"
+    /usr
+    /usr/local
+    /usr/local/cuda
+    /opt/cudnn
   )
 
   find_path(CUDNN_INCLUDE_DIR cudnn.h
@@ -98,12 +103,15 @@ if(ENABLE_CUDNN)
       ${CUDNN_ROOT_HINTS}
       ${CUDAToolkit_INCLUDE_DIRS}
       /usr/include
+      /usr/include/x86_64-linux-gnu
+      /usr/local/include
       /usr/local/cuda/include
     PATH_SUFFIXES
       include
       include/${CUDAToolkit_VERSION_MAJOR}.${CUDAToolkit_VERSION_MINOR}
       include/12.9
       include/13.1
+      targets/x86_64-linux/include
   )
 
   find_library(CUDNN_LIBRARY
@@ -111,13 +119,20 @@ if(ENABLE_CUDNN)
     HINTS
       ${CUDNN_ROOT_HINTS}
       /usr/lib
+      /usr/lib/x86_64-linux-gnu
+      /usr/local/lib
       /usr/local/cuda/lib64
     PATH_SUFFIXES
       lib
+      lib64
       lib/x64
       lib/${CUDAToolkit_VERSION_MAJOR}.${CUDAToolkit_VERSION_MINOR}/x64
+      lib/${CUDAToolkit_VERSION_MAJOR}.${CUDAToolkit_VERSION_MINOR}
       lib/12.9/x64
+      lib/12.9
       lib/13.1/x64
+      lib/13.1
+      targets/x86_64-linux/lib
   )
 
   if(CUDNN_INCLUDE_DIR AND CUDNN_LIBRARY)

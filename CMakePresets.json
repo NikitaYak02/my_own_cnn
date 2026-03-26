@@ -19,6 +19,21 @@
       }
     },
     {
+      "name": "linux-gcc-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-linux-base",
+      "cacheVariables": {
+        "ENABLE_CUDNN": "ON",
+        "CMAKE_CXX_COMPILER": "g++",
+        "CMAKE_CUDA_HOST_COMPILER": "g++"
+      },
+      "environment": {
+        "CC": "gcc",
+        "CXX": "g++"
+      }
+    },
+    {
       "name": "sm75",
       "displayName": "CUDA sm75 (Turing)",
       "inherits": "vs2022-base",
@@ -44,6 +59,33 @@
       "cacheVariables": {
         "CMAKE_CUDA_ARCHITECTURES": "89"
       }
+    },
+    {
+      "name": "linux-sm75-gcc",
+      "displayName": "Linux GCC + CUDA sm75",
+      "inherits": "linux-gcc-base",
+      "binaryDir": "${sourceDir}/build-linux-sm75-gcc",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "75"
+      }
+    },
+    {
+      "name": "linux-sm86-gcc",
+      "displayName": "Linux GCC + CUDA sm86 (Ampere 3090/A6000)",
+      "inherits": "linux-gcc-base",
+      "binaryDir": "${sourceDir}/build-linux-sm86-gcc",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "86"
+      }
+    },
+    {
+      "name": "linux-sm89-gcc",
+      "displayName": "Linux GCC + CUDA sm89 (Ada 4090)",
+      "inherits": "linux-gcc-base",
+      "binaryDir": "${sourceDir}/build-linux-sm89-gcc",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "89"
+      }
     }
   ],
   "buildPresets": [
@@ -61,6 +103,18 @@
       "name": "sm89-release",
       "configurePreset": "sm89",
       "configuration": "Release"
+    },
+    {
+      "name": "linux-sm75-gcc-release",
+      "configurePreset": "linux-sm75-gcc"
+    },
+    {
+      "name": "linux-sm86-gcc-release",
+      "configurePreset": "linux-sm86-gcc"
+    },
+    {
+      "name": "linux-sm89-gcc-release",
+      "configurePreset": "linux-sm89-gcc"
     }
   ]
 }
