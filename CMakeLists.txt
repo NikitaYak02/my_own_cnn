@@ -69,6 +69,17 @@ add_executable(quant_conv_test
 
 configure_cuda_target(quant_conv_test)
 
+add_executable(conv_grad_check
+  conv_grad_check.cpp
+  src/cpu_ref.cpp
+)
+
+target_include_directories(conv_grad_check PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
+set_target_properties(conv_grad_check PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+)
+
 if(ENABLE_CUDNN)
   find_path(CUDNN_INCLUDE_DIR cudnn.h
     HINTS
@@ -125,4 +136,7 @@ if(BUILD_TESTING)
 
   add_test(NAME quant_conv_test COMMAND quant_conv_test)
   set_tests_properties(quant_conv_test PROPERTIES LABELS "quant_conv")
+
+  add_test(NAME conv_grad_check_128x128 COMMAND conv_grad_check)
+  set_tests_properties(conv_grad_check_128x128 PROPERTIES LABELS "conv;grad")
 endif()
