@@ -117,6 +117,33 @@ const char* fwd_algo_to_string(cudnnConvolutionFwdAlgo_t algo) {
   }
 }
 
+const char* bwd_data_algo_to_string(cudnnConvolutionBwdDataAlgo_t algo) {
+  switch (algo) {
+    case CUDNN_CONVOLUTION_BWD_DATA_ALGO_0: return "CUDNN_CONVOLUTION_BWD_DATA_ALGO_0";
+    case CUDNN_CONVOLUTION_BWD_DATA_ALGO_1: return "CUDNN_CONVOLUTION_BWD_DATA_ALGO_1";
+    case CUDNN_CONVOLUTION_BWD_DATA_ALGO_FFT: return "CUDNN_CONVOLUTION_BWD_DATA_ALGO_FFT";
+    case CUDNN_CONVOLUTION_BWD_DATA_ALGO_FFT_TILING: return "CUDNN_CONVOLUTION_BWD_DATA_ALGO_FFT_TILING";
+    case CUDNN_CONVOLUTION_BWD_DATA_ALGO_WINOGRAD: return "CUDNN_CONVOLUTION_BWD_DATA_ALGO_WINOGRAD";
+    case CUDNN_CONVOLUTION_BWD_DATA_ALGO_WINOGRAD_NONFUSED: return "CUDNN_CONVOLUTION_BWD_DATA_ALGO_WINOGRAD_NONFUSED";
+    case CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT: return "CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT";
+    default: return "CUDNN_CONVOLUTION_BWD_DATA_ALGO_UNKNOWN";
+  }
+}
+
+const char* bwd_filter_algo_to_string(cudnnConvolutionBwdFilterAlgo_t algo) {
+  switch (algo) {
+    case CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0: return "CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0";
+    case CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1: return "CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1";
+    case CUDNN_CONVOLUTION_BWD_FILTER_ALGO_FFT: return "CUDNN_CONVOLUTION_BWD_FILTER_ALGO_FFT";
+    case CUDNN_CONVOLUTION_BWD_FILTER_ALGO_3: return "CUDNN_CONVOLUTION_BWD_FILTER_ALGO_3";
+    case CUDNN_CONVOLUTION_BWD_FILTER_ALGO_WINOGRAD: return "CUDNN_CONVOLUTION_BWD_FILTER_ALGO_WINOGRAD";
+    case CUDNN_CONVOLUTION_BWD_FILTER_ALGO_WINOGRAD_NONFUSED: return "CUDNN_CONVOLUTION_BWD_FILTER_ALGO_WINOGRAD_NONFUSED";
+    case CUDNN_CONVOLUTION_BWD_FILTER_ALGO_FFT_TILING: return "CUDNN_CONVOLUTION_BWD_FILTER_ALGO_FFT_TILING";
+    case CUDNN_CONVOLUTION_BWD_FILTER_ALGO_COUNT: return "CUDNN_CONVOLUTION_BWD_FILTER_ALGO_COUNT";
+    default: return "CUDNN_CONVOLUTION_BWD_FILTER_ALGO_UNKNOWN";
+  }
+}
+
 const char* math_type_to_string(cudnnMathType_t math_type) {
   switch (math_type) {
     case CUDNN_DEFAULT_MATH: return "CUDNN_DEFAULT_MATH";
@@ -251,6 +278,13 @@ BenchResult cudnn_bprop_bench(const float* d_dy, const float* d_w, float* d_dx,
   if (returned <= 0 || perf.status != CUDNN_STATUS_SUCCESS) {
     throw std::runtime_error("cuDNN failed to select backward-data algo");
   }
+  std::cout << "cudnn bprop algo=" << bwd_data_algo_to_string(perf.algo)
+            << " algo_id=" << static_cast<int>(perf.algo)
+            << " est_time_ms=" << perf.time
+            << " workspace_bytes=" << perf.memory
+            << " math_type=" << math_type_to_string(perf.mathType)
+            << " math_type_id=" << static_cast<int>(perf.mathType)
+            << "\n";
   cudnnConvolutionBwdDataAlgo_t algo = perf.algo;
 
   size_t ws_size = 0;
@@ -294,6 +328,13 @@ BenchResult cudnn_grad_bench(const float* d_x, const float* d_dy, float* d_dw,
   if (returned <= 0 || perf.status != CUDNN_STATUS_SUCCESS) {
     throw std::runtime_error("cuDNN failed to select backward-filter algo");
   }
+  std::cout << "cudnn grad algo=" << bwd_filter_algo_to_string(perf.algo)
+            << " algo_id=" << static_cast<int>(perf.algo)
+            << " est_time_ms=" << perf.time
+            << " workspace_bytes=" << perf.memory
+            << " math_type=" << math_type_to_string(perf.mathType)
+            << " math_type_id=" << static_cast<int>(perf.mathType)
+            << "\n";
   cudnnConvolutionBwdFilterAlgo_t algo = perf.algo;
 
   size_t ws_size = 0;
@@ -439,6 +480,13 @@ BenchResult cudnn_block_bprop_bench(const float* d_dy, const float* d_w, float* 
   if (returned <= 0 || perf.status != CUDNN_STATUS_SUCCESS) {
     throw std::runtime_error("cuDNN failed to select blocked backward-data algo");
   }
+  std::cout << "cudnn bprop algo=" << bwd_data_algo_to_string(perf.algo)
+            << " algo_id=" << static_cast<int>(perf.algo)
+            << " est_time_ms=" << perf.time
+            << " workspace_bytes=" << perf.memory
+            << " math_type=" << math_type_to_string(perf.mathType)
+            << " math_type_id=" << static_cast<int>(perf.mathType)
+            << "\n";
   cudnnConvolutionBwdDataAlgo_t algo = perf.algo;
   size_t ws_size = 0;
   CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(handle.h, d.w, d.dy, d.conv, d.dx, algo, &ws_size));
@@ -528,6 +576,13 @@ BenchResult cudnn_block_grad_bench(const float* d_x, const float* d_dy, float* d
   if (returned <= 0 || perf.status != CUDNN_STATUS_SUCCESS) {
     throw std::runtime_error("cuDNN failed to select blocked backward-filter algo");
   }
+  std::cout << "cudnn grad algo=" << bwd_filter_algo_to_string(perf.algo)
+            << " algo_id=" << static_cast<int>(perf.algo)
+            << " est_time_ms=" << perf.time
+            << " workspace_bytes=" << perf.memory
+            << " math_type=" << math_type_to_string(perf.mathType)
+            << " math_type_id=" << static_cast<int>(perf.mathType)
+            << "\n";
   cudnnConvolutionBwdFilterAlgo_t algo = perf.algo;
   size_t ws_size = 0;
   CUDNN_CHECK(cudnnGetConvolutionBackwardFilterWorkspaceSize(handle.h, d.x, d.dy, d.conv, d.dw, algo, &ws_size));
