@@ -1,0 +1,66 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "vs2022-base",
+      "hidden": true,
+      "generator": "Visual Studio 17 2022",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
+      "cacheVariables": {
+        "ENABLE_CUDNN": "ON"
+      }
+    },
+    {
+      "name": "sm75",
+      "displayName": "CUDA sm75 (Turing)",
+      "inherits": "vs2022-base",
+      "binaryDir": "${sourceDir}/build-sm75",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "75"
+      }
+    },
+    {
+      "name": "sm86",
+      "displayName": "CUDA sm86 (Ampere 3090/A6000)",
+      "inherits": "vs2022-base",
+      "binaryDir": "${sourceDir}/build-sm86",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "86"
+      }
+    },
+    {
+      "name": "sm89",
+      "displayName": "CUDA sm89 (Ada 4090)",
+      "inherits": "vs2022-base",
+      "binaryDir": "${sourceDir}/build-sm89",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "89"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "sm75-release",
+      "configurePreset": "sm75",
+      "configuration": "Release"
+    },
+    {
+      "name": "sm86-release",
+      "configurePreset": "sm86",
+      "configuration": "Release"
+    },
+    {
+      "name": "sm89-release",
+      "configurePreset": "sm89",
+      "configuration": "Release"
+    }
+  ]
+}
