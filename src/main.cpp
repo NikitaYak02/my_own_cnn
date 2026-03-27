@@ -78,7 +78,8 @@ GradKernelAlgo parse_grad_algo(const std::string& value) {
   if (value == "gemm") return GradKernelAlgo::GemmIm2Col;
   if (value == "algo0") return GradKernelAlgo::Algo0Atomic;
   if (value == "algo1") return GradKernelAlgo::Algo1Deterministic;
-  throw std::runtime_error("invalid value for --grad_algo: " + value + " (expected gemm|algo0|algo1|all)");
+  if (value == "algo2" || value == "tile") return GradKernelAlgo::Algo2TiledAtomic;
+  throw std::runtime_error("invalid value for --grad_algo: " + value + " (expected gemm|algo0|algo1|algo2|tile|all)");
 }
 
 const char* grad_algo_to_string(GradKernelAlgo algo) {
@@ -86,15 +87,17 @@ const char* grad_algo_to_string(GradKernelAlgo algo) {
     case GradKernelAlgo::GemmIm2Col: return "gemm";
     case GradKernelAlgo::Algo0Atomic: return "algo0";
     case GradKernelAlgo::Algo1Deterministic: return "algo1";
+    case GradKernelAlgo::Algo2TiledAtomic: return "algo2";
     default: return "unknown";
   }
 }
 
 std::vector<std::string> expand_grad_algo_names(const std::string& value) {
   if (value == "all") {
-    return {"gemm", "algo0", "algo1"};
+    return {"gemm", "algo0", "algo1", "algo2"};
   }
   (void)parse_grad_algo(value);
+  if (value == "tile") return {"algo2"};
   return {value};
 }
 
@@ -137,7 +140,7 @@ Options parse_args(int argc, char** argv) {
           << "conv_bench options:\n"
           << "  --op fprop|bprop|grad|all\n"
           << "  --custom_mode explicit|blocked\n"
-          << "  --grad_algo gemm|algo0|algo1|all\n"
+          << "  --grad_algo gemm|algo0|algo1|algo2|tile|all\n"
           << "  --n --h --w --c --k --r --s\n"
           << "  --pad_h --pad_w --stride_h --stride_w --dilation_h --dilation_w --groups\n"
           << "  --block_by --block_bx\n"
@@ -495,11 +498,13 @@ int main(int argc, char** argv) {
       std::vector<float> grad_ratios_gemm;
       std::vector<float> grad_ratios_algo0;
       std::vector<float> grad_ratios_algo1;
+      std::vector<float> grad_ratios_algo2;
 
       auto append_grad_ratio = [&](const std::string& algo_name, float ratio) {
         if (algo_name == "gemm") push_ratio(grad_ratios_gemm, ratio);
         else if (algo_name == "algo0") push_ratio(grad_ratios_algo0, ratio);
         else if (algo_name == "algo1") push_ratio(grad_ratios_algo1, ratio);
+        else if (algo_name == "algo2") push_ratio(grad_ratios_algo2, ratio);
       };
 
       for (const BenchCase& bc : cases) {
@@ -544,11 +549,13 @@ int main(int argc, char** argv) {
           print_ratio_summary_line("grad[gemm]", grad_ratios_gemm);
           print_ratio_summary_line("grad[algo0]", grad_ratios_algo0);
           print_ratio_summary_line("grad[algo1]", grad_ratios_algo1);
+          print_ratio_summary_line("grad[algo2]", grad_ratios_algo2);
         } else if (!grad_algo_names.empty()) {
           const std::string label = std::string("grad[") + grad_algo_names.front() + "]";
           if (grad_algo_names.front() == "gemm") print_ratio_summary_line(label.c_str(), grad_ratios_gemm);
           else if (grad_algo_names.front() == "algo0") print_ratio_summary_line(label.c_str(), grad_ratios_algo0);
           else if (grad_algo_names.front() == "algo1") print_ratio_summary_line(label.c_str(), grad_ratios_algo1);
+          else if (grad_algo_names.front() == "algo2") print_ratio_summary_line(label.c_str(), grad_ratios_algo2);
         }
       }
     };

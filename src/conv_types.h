@@ -194,6 +194,7 @@ enum class GradKernelAlgo {
   GemmIm2Col = 0,
   Algo0Atomic = 1,
   Algo1Deterministic = 2,
+  Algo2TiledAtomic = 3,
 };
 
 void cpu_fprop_nhwc(const TensorNHWC& x, const FilterKRSC& w, const Conv2DParams& p, TensorNHWC& y);

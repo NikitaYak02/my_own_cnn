@@ -38,6 +38,11 @@ void bmm_matmul(
     int batch, int M, int N, int K,
     int trans_a, int trans_b);
 
+void bmm_matmul_accum(
+    const float* A, const float* B, float* C,
+    int batch, int M, int N, int K,
+    int trans_a, int trans_b);
+
 /*
  * Batched Matrix Multiplication layer compatibility API.
  *
