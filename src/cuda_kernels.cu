@@ -60,7 +60,7 @@ void ensure_capacity(float** ptr, size_t* cap, size_t elements) {
 constexpr int kGradSplitKBlockSize = 256;
 constexpr int kGradSplitKWarpSize = 32;
 constexpr int kGradSplitKWarpsPerBlock = kGradSplitKBlockSize / kGradSplitKWarpSize;
-constexpr int kGradSplitKOutputsPerWarp = 4;
+constexpr int kGradSplitKTileRows = 256;
 constexpr int kGradSplitKTargetRowsPerChunk = 2048;
 constexpr int kGradSplitKMaxChunks = 16;
 constexpr size_t kGradSplitKMaxPartialElements = 8ull * 1024ull * 1024ull;
@@ -735,12 +735,14 @@ __global__ void grad_filter_algo1_splitk_partials_nhwc_kernel(const float* __res
                                                               int cin_base, int cin_group,
                                                               int kout_base, int kout_group,
                                                               int rows_per_chunk) {
+  __shared__ float x_tile[kGradSplitKTileRows];
+
   const int warp_id = threadIdx.x / kGradSplitKWarpSize;
   const int lane = threadIdx.x % kGradSplitKWarpSize;
-  const int slice_weights = r * s * cin_group * kout_group;
-  const int k_groups_per_row = (kout_group + kGradSplitKOutputsPerWarp - 1) / kGradSplitKOutputsPerWarp;
-  const int packed_weight_idx = blockIdx.x * kGradSplitKWarpsPerBlock + warp_id;
-  const int total_packed_weights = r * s * cin_group * k_groups_per_row;
+  const int weight_rows = r * s * cin_group;
+  const int k_groups_per_row = (kout_group + kGradSplitKWarpsPerBlock - 1) / kGradSplitKWarpsPerBlock;
+  const int packed_weight_idx = blockIdx.x;
+  const int total_packed_weights = weight_rows * k_groups_per_row;
   if (packed_weight_idx >= total_packed_weights) return;
 
   const int split_idx = blockIdx.y;
@@ -756,43 +758,47 @@ __global__ void grad_filter_algo1_splitk_partials_nhwc_kernel(const float* __res
   const int t0 = k_row / cin_group;
   const int ss = t0 % s;
   const int rr = t0 / s;
-  const int k_local_base = k_group * kGradSplitKOutputsPerWarp;
+  const int k_local = k_group * kGradSplitKWarpsPerBlock + warp_id;
+  const int slice_weights = weight_rows * kout_group;
 
-  float sums[kGradSplitKOutputsPerWarp] = {0.0f, 0.0f, 0.0f, 0.0f};
-  for (int row = row_begin + lane; row < row_end; row += kGradSplitKWarpSize) {
-    const int n_idx = row / (ho * wo);
-    const int rem = row - n_idx * (ho * wo);
-    const int ho_idx = rem / wo;
-    const int wo_idx = rem - ho_idx * wo;
+  float sum = 0.0f;
+  for (int tile_begin = row_begin; tile_begin < row_end; tile_begin += kGradSplitKTileRows) {
+    const int tile_count = min(kGradSplitKTileRows, row_end - tile_begin);
 
-    const int hi = ho_idx * stride_h - pad_h + rr * dilation_h;
-    const int wi = wo_idx * stride_w - pad_w + ss * dilation_w;
-    if (hi < 0 || hi >= h || wi < 0 || wi >= w) continue;
+    for (int t = threadIdx.x; t < tile_count; t += blockDim.x) {
+      const int row = tile_begin + t;
+      const int n_idx = row / (ho * wo);
+      const int rem = row - n_idx * (ho * wo);
+      const int ho_idx = rem / wo;
+      const int wo_idx = rem - ho_idx * wo;
+      const int hi = ho_idx * stride_h - pad_h + rr * dilation_h;
+      const int wi = wo_idx * stride_w - pad_w + ss * dilation_w;
 
-    const float xv = x[idx_nhwc(n_idx, hi, wi, cin_base + ci, h, w, c)];
-    #pragma unroll
-    for (int kk = 0; kk < kGradSplitKOutputsPerWarp; ++kk) {
-      const int k_local = k_local_base + kk;
-      if (k_local >= kout_group) continue;
-      const float dyv = dy[idx_nhwc(n_idx, ho_idx, wo_idx, kout_base + k_local, ho, wo, k)];
-      sums[kk] += xv * dyv;
+      float xv = 0.0f;
+      if (hi >= 0 && hi < h && wi >= 0 && wi < w) {
+        xv = x[idx_nhwc(n_idx, hi, wi, cin_base + ci, h, w, c)];
+      }
+      x_tile[t] = xv;
     }
-  }
+    __syncthreads();
 
-  #pragma unroll
-  for (int kk = 0; kk < kGradSplitKOutputsPerWarp; ++kk) {
-    sums[kk] = warp_reduce_sum(sums[kk]);
-  }
-
-  if (lane == 0) {
-    const size_t partial_base = static_cast<size_t>(split_idx) * slice_weights + static_cast<size_t>(k_row) * kout_group;
-    #pragma unroll
-    for (int kk = 0; kk < kGradSplitKOutputsPerWarp; ++kk) {
-      const int k_local = k_local_base + kk;
-      if (k_local < kout_group) {
-        partials[partial_base + k_local] = sums[kk];
+    if (k_local < kout_group) {
+      for (int t = lane; t < tile_count; t += kGradSplitKWarpSize) {
+        const int row = tile_begin + t;
+        const int n_idx = row / (ho * wo);
+        const int rem = row - n_idx * (ho * wo);
+        const int ho_idx = rem / wo;
+        const int wo_idx = rem - ho_idx * wo;
+        const float dyv = dy[idx_nhwc(n_idx, ho_idx, wo_idx, kout_base + k_local, ho, wo, k)];
+        sum += x_tile[t] * dyv;
       }
     }
+    __syncthreads();
+  }
+
+  sum = warp_reduce_sum(sum);
+  if (lane == 0 && k_local < kout_group) {
+    partials[static_cast<size_t>(split_idx) * slice_weights + static_cast<size_t>(k_row) * kout_group + k_local] = sum;
   }
 }
 
@@ -871,12 +877,14 @@ __global__ void block_grad_filter_algo1_splitk_partials_nhwc_kernel(const float*
                                                                     int cin_base, int cin_group,
                                                                     int kout_base, int kout_group,
                                                                     int rows_per_chunk) {
+  __shared__ float x_tile[kGradSplitKTileRows];
+
   const int warp_id = threadIdx.x / kGradSplitKWarpSize;
   const int lane = threadIdx.x % kGradSplitKWarpSize;
-  const int slice_weights = r * s * cin_group * kout_group;
-  const int k_groups_per_row = (kout_group + kGradSplitKOutputsPerWarp - 1) / kGradSplitKOutputsPerWarp;
-  const int packed_weight_idx = blockIdx.x * kGradSplitKWarpsPerBlock + warp_id;
-  const int total_packed_weights = r * s * cin_group * k_groups_per_row;
+  const int weight_rows = r * s * cin_group;
+  const int k_groups_per_row = (kout_group + kGradSplitKWarpsPerBlock - 1) / kGradSplitKWarpsPerBlock;
+  const int packed_weight_idx = blockIdx.x;
+  const int total_packed_weights = weight_rows * k_groups_per_row;
   if (packed_weight_idx >= total_packed_weights) return;
 
   const int split_idx = blockIdx.y;
@@ -892,45 +900,51 @@ __global__ void block_grad_filter_algo1_splitk_partials_nhwc_kernel(const float*
   const int t0 = k_row / cin_group;
   const int ss = t0 % s;
   const int rr = t0 / s;
-  const int k_local_base = k_group * kGradSplitKOutputsPerWarp;
+  const int k_local = k_group * kGradSplitKWarpsPerBlock + warp_id;
+  const int slice_weights = weight_rows * kout_group;
 
-  float sums[kGradSplitKOutputsPerWarp] = {0.0f, 0.0f, 0.0f, 0.0f};
-  for (int row = row_begin + lane; row < row_end; row += kGradSplitKWarpSize) {
-    const int n_idx = row / (block_ho * block_wo);
-    const int rem = row - n_idx * (block_ho * block_wo);
-    const int lho = rem / block_wo;
-    const int lwo = rem - lho * block_wo;
-    const int ho_idx = ho_start + lho;
-    const int wo_idx = wo_start + lwo;
+  float sum = 0.0f;
+  for (int tile_begin = row_begin; tile_begin < row_end; tile_begin += kGradSplitKTileRows) {
+    const int tile_count = min(kGradSplitKTileRows, row_end - tile_begin);
 
-    const int hi = ho_idx * stride_h - pad_h + rr * dilation_h;
-    const int wi = wo_idx * stride_w - pad_w + ss * dilation_w;
-    if (hi < 0 || hi >= h || wi < 0 || wi >= w) continue;
+    for (int t = threadIdx.x; t < tile_count; t += blockDim.x) {
+      const int row = tile_begin + t;
+      const int n_idx = row / (block_ho * block_wo);
+      const int rem = row - n_idx * (block_ho * block_wo);
+      const int lho = rem / block_wo;
+      const int lwo = rem - lho * block_wo;
+      const int ho_idx = ho_start + lho;
+      const int wo_idx = wo_start + lwo;
+      const int hi = ho_idx * stride_h - pad_h + rr * dilation_h;
+      const int wi = wo_idx * stride_w - pad_w + ss * dilation_w;
 
-    const float xv = x[idx_nhwc(n_idx, hi, wi, cin_base + ci, h, w, c)];
-    #pragma unroll
-    for (int kk = 0; kk < kGradSplitKOutputsPerWarp; ++kk) {
-      const int k_local = k_local_base + kk;
-      if (k_local >= kout_group) continue;
-      const float dyv = dy[idx_nhwc(n_idx, ho_idx, wo_idx, kout_base + k_local, ho, wo, k)];
-      sums[kk] += xv * dyv;
+      float xv = 0.0f;
+      if (hi >= 0 && hi < h && wi >= 0 && wi < w) {
+        xv = x[idx_nhwc(n_idx, hi, wi, cin_base + ci, h, w, c)];
+      }
+      x_tile[t] = xv;
     }
-  }
+    __syncthreads();
 
-  #pragma unroll
-  for (int kk = 0; kk < kGradSplitKOutputsPerWarp; ++kk) {
-    sums[kk] = warp_reduce_sum(sums[kk]);
-  }
-
-  if (lane == 0) {
-    const size_t partial_base = static_cast<size_t>(split_idx) * slice_weights + static_cast<size_t>(k_row) * kout_group;
-    #pragma unroll
-    for (int kk = 0; kk < kGradSplitKOutputsPerWarp; ++kk) {
-      const int k_local = k_local_base + kk;
-      if (k_local < kout_group) {
-        partials[partial_base + k_local] = sums[kk];
+    if (k_local < kout_group) {
+      for (int t = lane; t < tile_count; t += kGradSplitKWarpSize) {
+        const int row = tile_begin + t;
+        const int n_idx = row / (block_ho * block_wo);
+        const int rem = row - n_idx * (block_ho * block_wo);
+        const int lho = rem / block_wo;
+        const int lwo = rem - lho * block_wo;
+        const int ho_idx = ho_start + lho;
+        const int wo_idx = wo_start + lwo;
+        const float dyv = dy[idx_nhwc(n_idx, ho_idx, wo_idx, kout_base + k_local, ho, wo, k)];
+        sum += x_tile[t] * dyv;
       }
     }
+    __syncthreads();
+  }
+
+  sum = warp_reduce_sum(sum);
+  if (lane == 0 && k_local < kout_group) {
+    partials[static_cast<size_t>(split_idx) * slice_weights + static_cast<size_t>(k_row) * kout_group + k_local] = sum;
   }
 }
 
@@ -1148,7 +1162,7 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
     const int m = n * sh.ho * sh.wo;
     const int slice_weights = r * s * sh.cin_group * sh.kout_group;
     const int packed_weights = r * s * sh.cin_group *
-                               ((sh.kout_group + kGradSplitKOutputsPerWarp - 1) / kGradSplitKOutputsPerWarp);
+                               ((sh.kout_group + kGradSplitKWarpsPerBlock - 1) / kGradSplitKWarpsPerBlock);
     const int split_k = select_grad_split_k(m, static_cast<size_t>(slice_weights));
     const int rows_per_chunk = (m + split_k - 1) / split_k;
 
@@ -1157,7 +1171,7 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
     ensure_capacity(&ws.d_dwg, &ws.d_dwg_cap, static_cast<size_t>(slice_weights));
 
     const dim3 block(kGradSplitKBlockSize);
-    const dim3 grid((packed_weights + kGradSplitKWarpsPerBlock - 1) / kGradSplitKWarpsPerBlock, split_k);
+    const dim3 grid(packed_weights, split_k);
     const int reduce_blocks = (slice_weights + 255) / 256;
 
     for (int g = 0; g < p.groups; ++g) {
@@ -1385,7 +1399,7 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
     const int m_block = n * sh.block_ho * sh.block_wo;
     const int slice_weights = r * s * sh.base.cin_group * sh.base.kout_group;
     const int packed_weights = r * s * sh.base.cin_group *
-                               ((sh.base.kout_group + kGradSplitKOutputsPerWarp - 1) / kGradSplitKOutputsPerWarp);
+                               ((sh.base.kout_group + kGradSplitKWarpsPerBlock - 1) / kGradSplitKWarpsPerBlock);
     const int split_k = select_grad_split_k(m_block, static_cast<size_t>(slice_weights));
     const int rows_per_chunk = (m_block + split_k - 1) / split_k;
 
@@ -1394,7 +1408,7 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
     ensure_capacity(&ws.d_dwg, &ws.d_dwg_cap, static_cast<size_t>(slice_weights));
 
     const dim3 block(kGradSplitKBlockSize);
-    const dim3 grid((packed_weights + kGradSplitKWarpsPerBlock - 1) / kGradSplitKWarpsPerBlock, split_k);
+    const dim3 grid(packed_weights, split_k);
     const int reduce_blocks = (slice_weights + 255) / 256;
 
     for (int g = 0; g < p.conv.groups; ++g) {
