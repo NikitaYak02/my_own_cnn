@@ -15,7 +15,7 @@ endif()
 message(STATUS "Configuring CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "52")
-  message(WARNING "CUDA architecture 52 is a legacy target. Use a fresh build directory or one of the presets (sm86, sm89, linux-sm86-gcc, linux-sm89-gcc) for Ampere/Ada GPUs.")
+  message(WARNING "CUDA architecture 52 is a legacy target. Use a fresh build directory or one of the presets (auto, sm86, sm89, linux-auto-gcc, linux-sm86-gcc, linux-sm89-gcc) for modern GPUs.")
 endif()
 
 option(ENABLE_CUDNN "Enable cuDNN benchmark/reference" ON)

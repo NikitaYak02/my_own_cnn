@@ -43,6 +43,15 @@
       }
     },
     {
+      "name": "auto",
+      "displayName": "CUDA native (auto-detect current GPU)",
+      "inherits": "vs2022-base",
+      "binaryDir": "${sourceDir}/build-auto",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "native"
+      }
+    },
+    {
       "name": "sm86",
       "displayName": "CUDA sm86 (Ampere 3090/A6000)",
       "inherits": "vs2022-base",
@@ -67,6 +76,15 @@
       "binaryDir": "${sourceDir}/build-linux-sm75-gcc",
       "cacheVariables": {
         "CMAKE_CUDA_ARCHITECTURES": "75"
+      }
+    },
+    {
+      "name": "linux-auto-gcc",
+      "displayName": "Linux GCC + CUDA native (auto-detect current GPU)",
+      "inherits": "linux-gcc-base",
+      "binaryDir": "${sourceDir}/build-linux-auto-gcc",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "native"
       }
     },
     {
@@ -95,6 +113,11 @@
       "configuration": "Release"
     },
     {
+      "name": "auto-release",
+      "configurePreset": "auto",
+      "configuration": "Release"
+    },
+    {
       "name": "sm86-release",
       "configurePreset": "sm86",
       "configuration": "Release"
@@ -107,6 +130,10 @@
     {
       "name": "linux-sm75-gcc-release",
       "configurePreset": "linux-sm75-gcc"
+    },
+    {
+      "name": "linux-auto-gcc-release",
+      "configurePreset": "linux-auto-gcc"
     },
     {
       "name": "linux-sm86-gcc-release",
