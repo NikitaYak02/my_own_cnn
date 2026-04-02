@@ -26,6 +26,8 @@ struct Conv2DParams {
   int dilation_h = 1;
   int dilation_w = 1;
   int groups = 1;
+  int ay = 1;
+  int ax = 1;
 };
 
 struct BlockConv2DParams {
@@ -49,25 +51,29 @@ struct TensorNHWC {
   const float* ptr() const { return data.data(); }
 };
 
-// Filter memory is stored output-channel major: [K, R, S, C].
+// Filter memory is stored output-channel major: [K, R, S, C, Ay, Ax].
 struct FilterKRSC {
   int r = 0;
   int s = 0;
   int cin_per_group = 0;
   int k = 0;
+  int ay = 1;
+  int ax = 1;
   std::vector<float> data;
 
   FilterKRSC() = default;
-  FilterKRSC(int r_, int s_, int cin_per_group_, int k_) : r(r_), s(s_), cin_per_group(cin_per_group_), k(k_), data(static_cast<size_t>(r_) * s_ * cin_per_group_ * k_) {}
+  FilterKRSC(int r_, int s_, int cin_per_group_, int k_, int ay_ = 1, int ax_ = 1)
+      : r(r_), s(s_), cin_per_group(cin_per_group_), k(k_), ay(ay_), ax(ax_),
+        data(static_cast<size_t>(r_) * s_ * cin_per_group_ * k_ * ay_ * ax_) {}
 
-  size_t elements() const { return static_cast<size_t>(r) * s * cin_per_group * k; }
+  size_t elements() const { return static_cast<size_t>(r) * s * cin_per_group * k * ay * ax; }
   float* ptr() { return data.data(); }
   const float* ptr() const { return data.data(); }
 };
 
 using FilterHWCN = FilterKRSC;
 
-// Blocked filter memory is stored as [K, By, Bx, R, S, C].
+// Blocked filter memory is stored as [K, By, Bx, R, S, C, Ay, Ax].
 struct BlockFilterKByBxRSC {
   int k = 0;
   int by = 0;
@@ -75,14 +81,16 @@ struct BlockFilterKByBxRSC {
   int r = 0;
   int s = 0;
   int cin_per_group = 0;
+  int ay = 1;
+  int ax = 1;
   std::vector<float> data;
 
   BlockFilterKByBxRSC() = default;
-  BlockFilterKByBxRSC(int k_, int by_, int bx_, int r_, int s_, int cin_per_group_)
-      : k(k_), by(by_), bx(bx_), r(r_), s(s_), cin_per_group(cin_per_group_),
-        data(static_cast<size_t>(k_) * by_ * bx_ * r_ * s_ * cin_per_group_) {}
+  BlockFilterKByBxRSC(int k_, int by_, int bx_, int r_, int s_, int cin_per_group_, int ay_ = 1, int ax_ = 1)
+      : k(k_), by(by_), bx(bx_), r(r_), s(s_), cin_per_group(cin_per_group_), ay(ay_), ax(ax_),
+        data(static_cast<size_t>(k_) * by_ * bx_ * r_ * s_ * cin_per_group_ * ay_ * ax_) {}
 
-  size_t elements() const { return static_cast<size_t>(k) * by * bx * r * s * cin_per_group; }
+  size_t elements() const { return static_cast<size_t>(k) * by * bx * r * s * cin_per_group * ay * ax; }
   float* ptr() { return data.data(); }
   const float* ptr() const { return data.data(); }
 };
@@ -105,8 +113,12 @@ struct TensorNHWCI32 {
 };
 
 struct ConvShape {
+  int base_ho = 0;
+  int base_wo = 0;
   int ho = 0;
   int wo = 0;
+  int ay = 1;
+  int ax = 1;
   int cin_group = 0;
   int kout_group = 0;
 };
@@ -119,22 +131,28 @@ struct BlockConvShape {
 
 inline ConvShape infer_conv_shape(const TensorNHWC& x, const FilterKRSC& w, const Conv2DParams& p) {
   if (p.groups <= 0) throw std::runtime_error("groups must be > 0");
+  if (p.ay <= 0 || p.ax <= 0) throw std::runtime_error("ay and ax must be > 0");
   if (x.c % p.groups != 0) throw std::runtime_error("input channels must be divisible by groups");
   if (w.k % p.groups != 0) throw std::runtime_error("output channels must be divisible by groups");
   const int cin_group = x.c / p.groups;
   if (cin_group != w.cin_per_group) throw std::runtime_error("filter cin_per_group mismatch");
+  if (w.ay != p.ay || w.ax != p.ax) throw std::runtime_error("filter Ay/Ax mismatch");
 
   const int ho_num = x.h + 2 * p.pad_h - p.dilation_h * (w.r - 1) - 1;
   const int wo_num = x.w + 2 * p.pad_w - p.dilation_w * (w.s - 1) - 1;
   if (ho_num < 0 || wo_num < 0) throw std::runtime_error("invalid output size (negative numerator)");
   if (p.stride_h <= 0 || p.stride_w <= 0) throw std::runtime_error("stride must be > 0");
-  const int ho = ho_num / p.stride_h + 1;
-  const int wo = wo_num / p.stride_w + 1;
-  if (ho <= 0 || wo <= 0) throw std::runtime_error("computed output size is <= 0");
+  const int base_ho = ho_num / p.stride_h + 1;
+  const int base_wo = wo_num / p.stride_w + 1;
+  if (base_ho <= 0 || base_wo <= 0) throw std::runtime_error("computed output size is <= 0");
 
   ConvShape shape;
-  shape.ho = ho;
-  shape.wo = wo;
+  shape.base_ho = base_ho;
+  shape.base_wo = base_wo;
+  shape.ho = base_ho * p.ay;
+  shape.wo = base_wo * p.ax;
+  shape.ay = p.ay;
+  shape.ax = p.ax;
   shape.cin_group = cin_group;
   shape.kout_group = w.k / p.groups;
   return shape;
@@ -150,16 +168,16 @@ inline BlockConvShape infer_block_conv_shape(const TensorNHWC& x,
     throw std::runtime_error("blocked filter block grid mismatch");
   }
 
-  const FilterKRSC dense_w(w.r, w.s, w.cin_per_group, w.k);
+  const FilterKRSC dense_w(w.r, w.s, w.cin_per_group, w.k, w.ay, w.ax);
   const ConvShape base = infer_conv_shape(x, dense_w, p.conv);
-  if ((base.ho % p.block_by) != 0 || (base.wo % p.block_bx) != 0) {
-    throw std::runtime_error("blocked convolution requires Ho/Wo divisible by block grid");
+  if ((base.base_ho % p.block_by) != 0 || (base.base_wo % p.block_bx) != 0) {
+    throw std::runtime_error("blocked convolution requires base Ho/Wo divisible by block grid");
   }
 
   BlockConvShape shape;
   shape.base = base;
-  shape.block_ho = base.ho / p.block_by;
-  shape.block_wo = base.wo / p.block_bx;
+  shape.block_ho = base.base_ho / p.block_by;
+  shape.block_wo = base.base_wo / p.block_bx;
   return shape;
 }
 
@@ -171,9 +189,19 @@ __host__ __device__ inline size_t idx_krsc(int k, int r, int s, int c, int R, in
   return ((static_cast<size_t>(k) * R + r) * S + s) * C + c;
 }
 
+__host__ __device__ inline size_t idx_krsc(int k, int r, int s, int c, int ay, int ax,
+                                           int R, int S, int C, int Ay, int Ax) {
+  return ((((((static_cast<size_t>(k) * R + r) * S + s) * C + c) * Ay + ay) * Ax) + ax);
+}
+
 __host__ __device__ inline size_t idx_kbybxrsc(int k, int by, int bx, int r, int s, int c,
                                                int By, int Bx, int R, int S, int C) {
   return (((((static_cast<size_t>(k) * By + by) * Bx + bx) * R + r) * S + s) * C + c);
+}
+
+__host__ __device__ inline size_t idx_kbybxrsc(int k, int by, int bx, int r, int s, int c, int ay, int ax,
+                                               int By, int Bx, int R, int S, int C, int Ay, int Ax) {
+  return (((((((((static_cast<size_t>(k) * By + by) * Bx + bx) * R + r) * S + s) * C + c) * Ay + ay) * Ax) + ax));
 }
 
 struct VerifyResult {

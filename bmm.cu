@@ -203,16 +203,28 @@ __global__ void bmm_tiled_kernel(
     const float* __restrict__ A,
     const float* __restrict__ B,
     float* __restrict__ C,
-    int M, int N, int K)
+    int batch, int M, int N, int K,
+    int tiles_m, int tiles_n,
+    size_t tile_block_offset)
 {
-    // blockIdx.z selects the current matrix pair within the batch.
-    const int batch_idx = blockIdx.z;
+    // Linearize output tiles so large M or batch values do not overflow
+    // gridDim.y / gridDim.z, which are capped at 65535.
+    const size_t linear_tile = tile_block_offset + static_cast<size_t>(blockIdx.x);
+    const size_t tile_row_batch = linear_tile / static_cast<size_t>(tiles_n);
+    const size_t batch_linear = tile_row_batch / static_cast<size_t>(tiles_m);
+    if (batch_linear >= static_cast<size_t>(batch)) {
+        return;
+    }
+
+    const int batch_idx = static_cast<int>(batch_linear);
+    const int tile_row_idx = static_cast<int>(tile_row_batch - batch_linear * static_cast<size_t>(tiles_m));
+    const int tile_col_idx = static_cast<int>(linear_tile - tile_row_batch * static_cast<size_t>(tiles_n));
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
     const int tid = ty * blockDim.x + tx;
 
-    const int tile_row = blockIdx.y * kBlockRows;
-    const int tile_col = blockIdx.x * kBlockCols;
+    const int tile_row = tile_row_idx * kBlockRows;
+    const int tile_col = tile_col_idx * kBlockCols;
     const int local_row = ty * kThreadRows;
     const int local_col = tx * kThreadCols;
     const int out_row0 = tile_row + local_row;
@@ -313,12 +325,27 @@ static void launch_bmm_kernel(
     int N,
     int K)
 {
-    dim3 block(kBlockCols / kThreadCols, kBlockRows / kThreadRows);
-    dim3 grid((N + kBlockCols - 1) / kBlockCols,
-              (M + kBlockRows - 1) / kBlockRows,
-              batch);
+    if (batch <= 0 || M <= 0 || N <= 0 || K <= 0) {
+        return;
+    }
 
-    bmm_tiled_kernel<TRANS_A, TRANS_B, ACCUM><<<grid, block>>>(A, B, C, M, N, K);
+    dim3 block(kBlockCols / kThreadCols, kBlockRows / kThreadRows);
+    const int tiles_m = (M + kBlockRows - 1) / kBlockRows;
+    const int tiles_n = (N + kBlockCols - 1) / kBlockCols;
+    const size_t total_tiles = static_cast<size_t>(batch) * tiles_m * tiles_n;
+    constexpr unsigned int kMaxGridX = 0x7fffffffu;
+
+    for (size_t tile_offset = 0; tile_offset < total_tiles; ) {
+        const size_t remaining_tiles = total_tiles - tile_offset;
+        const unsigned int grid_x =
+            remaining_tiles > static_cast<size_t>(kMaxGridX)
+                ? kMaxGridX
+                : static_cast<unsigned int>(remaining_tiles);
+        dim3 grid(grid_x, 1, 1);
+        bmm_tiled_kernel<TRANS_A, TRANS_B, ACCUM><<<grid, block>>>(
+            A, B, C, batch, M, N, K, tiles_m, tiles_n, tile_offset);
+        tile_offset += grid_x;
+    }
 }
 
 template <bool TRANS_A, bool TRANS_B>
@@ -326,15 +353,26 @@ __global__ void bmm_tiled_i32_kernel(
     const int32_t* __restrict__ A,
     const int32_t* __restrict__ B,
     int32_t* __restrict__ C,
-    int M, int N, int K)
+    int batch, int M, int N, int K,
+    int tiles_m, int tiles_n,
+    size_t tile_block_offset)
 {
-    const int batch_idx = blockIdx.z;
+    const size_t linear_tile = tile_block_offset + static_cast<size_t>(blockIdx.x);
+    const size_t tile_row_batch = linear_tile / static_cast<size_t>(tiles_n);
+    const size_t batch_linear = tile_row_batch / static_cast<size_t>(tiles_m);
+    if (batch_linear >= static_cast<size_t>(batch)) {
+        return;
+    }
+
+    const int batch_idx = static_cast<int>(batch_linear);
+    const int tile_row_idx = static_cast<int>(tile_row_batch - batch_linear * static_cast<size_t>(tiles_m));
+    const int tile_col_idx = static_cast<int>(linear_tile - tile_row_batch * static_cast<size_t>(tiles_n));
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
     const int tid = ty * blockDim.x + tx;
 
-    const int tile_row = blockIdx.y * kBlockRows;
-    const int tile_col = blockIdx.x * kBlockCols;
+    const int tile_row = tile_row_idx * kBlockRows;
+    const int tile_col = tile_col_idx * kBlockCols;
     const int local_row = ty * kThreadRows;
     const int local_col = tx * kThreadCols;
     const int out_row0 = tile_row + local_row;
@@ -424,12 +462,27 @@ static void launch_bmm_i32_kernel(
     int N,
     int K)
 {
-    dim3 block(kBlockCols / kThreadCols, kBlockRows / kThreadRows);
-    dim3 grid((N + kBlockCols - 1) / kBlockCols,
-              (M + kBlockRows - 1) / kBlockRows,
-              batch);
+    if (batch <= 0 || M <= 0 || N <= 0 || K <= 0) {
+        return;
+    }
 
-    bmm_tiled_i32_kernel<TRANS_A, TRANS_B><<<grid, block>>>(A, B, C, M, N, K);
+    dim3 block(kBlockCols / kThreadCols, kBlockRows / kThreadRows);
+    const int tiles_m = (M + kBlockRows - 1) / kBlockRows;
+    const int tiles_n = (N + kBlockCols - 1) / kBlockCols;
+    const size_t total_tiles = static_cast<size_t>(batch) * tiles_m * tiles_n;
+    constexpr unsigned int kMaxGridX = 0x7fffffffu;
+
+    for (size_t tile_offset = 0; tile_offset < total_tiles; ) {
+        const size_t remaining_tiles = total_tiles - tile_offset;
+        const unsigned int grid_x =
+            remaining_tiles > static_cast<size_t>(kMaxGridX)
+                ? kMaxGridX
+                : static_cast<unsigned int>(remaining_tiles);
+        dim3 grid(grid_x, 1, 1);
+        bmm_tiled_i32_kernel<TRANS_A, TRANS_B><<<grid, block>>>(
+            A, B, C, batch, M, N, K, tiles_m, tiles_n, tile_offset);
+        tile_offset += grid_x;
+    }
 }
 
 /* ================================================================== */
@@ -442,6 +495,10 @@ static void bmm_matmul_impl(
     int trans_a, int trans_b,
     bool accumulate)
 {
+    if (batch <= 0 || M <= 0 || N <= 0 || K <= 0) {
+        return;
+    }
+
     // Dispatch once on transpose flags so the inner kernel can stay branch-free
     // with respect to data layout.
     const bool transpose_a = trans_a != 0;
@@ -505,6 +562,10 @@ extern "C" void bmm_matmul_i32(
     int batch, int M, int N, int K,
     int trans_a, int trans_b)
 {
+    if (batch <= 0 || M <= 0 || N <= 0 || K <= 0) {
+        return;
+    }
+
     const bool transpose_a = trans_a != 0;
     const bool transpose_b = trans_b != 0;
 

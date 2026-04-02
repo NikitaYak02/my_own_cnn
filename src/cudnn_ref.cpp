@@ -80,6 +80,9 @@ struct DescPack {
 };
 
 void setup_descs(DescPack& d, int n, int h, int w, int c, int r, int s, int k, const Conv2DParams& p, int ho, int wo) {
+  if (p.ay != 1 || p.ax != 1) {
+    throw std::runtime_error("cuDNN reference does not support ay/ax != 1");
+  }
   CUDNN_CHECK(cudnnSetTensor4dDescriptor(d.x, CUDNN_TENSOR_NHWC, CUDNN_DATA_FLOAT, n, c, h, w));
   CUDNN_CHECK(cudnnSetTensor4dDescriptor(d.dx, CUDNN_TENSOR_NHWC, CUDNN_DATA_FLOAT, n, c, h, w));
   CUDNN_CHECK(cudnnSetTensor4dDescriptor(d.y, CUDNN_TENSOR_NHWC, CUDNN_DATA_FLOAT, n, k, ho, wo));

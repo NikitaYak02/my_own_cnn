@@ -19,6 +19,8 @@ struct Workspace {
   int packed_cin_group = 0;
   int packed_k = 0;
   int packed_groups = 0;
+  int packed_ay = 1;
+  int packed_ax = 1;
   const float* packed_block_w_src = nullptr;
   int packed_block_by = 0;
   int packed_block_bx = 0;
@@ -27,6 +29,8 @@ struct Workspace {
   int packed_block_cin_group = 0;
   int packed_block_k = 0;
   int packed_block_groups = 0;
+  int packed_block_ay = 1;
+  int packed_block_ax = 1;
   float* d_ymat = nullptr;
   size_t d_ymat_cap = 0;
   float* d_dy_mat = nullptr;
@@ -115,22 +119,72 @@ __device__ __forceinline__ void decode_kdim_index(int kdim_idx, int s, int cin_g
   rr = t0 / s;
 }
 
+__device__ __forceinline__ void decode_output_app_index(int ext_idx, int ay, int ax,
+                                                        int& ko, int& ay_idx, int& ax_idx) {
+  const int app = ay * ax;
+  ko = ext_idx / app;
+  const int rem = ext_idx - ko * app;
+  ay_idx = rem / ax;
+  ax_idx = rem - ay_idx * ax;
+}
+
 __global__ void pack_filter_krsc_group_kernel(const float* __restrict__ w,
                                               float* __restrict__ wg,
                                               int r, int s, int cin_group,
+                                              int ay, int ax,
                                               int k_base, int kout_group);
 __global__ void pack_block_filter_kbybxrsc_group_kernel(const float* __restrict__ w,
                                                         float* __restrict__ wg,
                                                         int by_count, int bx_count,
                                                         int r, int s, int cin_group,
+                                                        int ay, int ax,
                                                         int block_y, int block_x,
                                                         int k_base, int kout_group);
+__global__ void pack_nhwc_group_matrix_app_kernel(const float* __restrict__ src,
+                                                  float* __restrict__ dst,
+                                                  int n, int base_h, int base_w,
+                                                  int ay, int ax,
+                                                  int c, int c_base, int c_count);
+__global__ void pack_nhwc_group_matrix_app_rows_kernel(const float* __restrict__ src,
+                                                       float* __restrict__ dst,
+                                                       int n, int base_h, int base_w,
+                                                       int ay, int ax,
+                                                       int c,
+                                                       int row_start, int row_count,
+                                                       int c_base, int c_count);
+__global__ void unpack_matrix_to_nhwc_group_app_kernel(const float* __restrict__ src,
+                                                       float* __restrict__ dst,
+                                                       int n, int base_h, int base_w,
+                                                       int ay, int ax,
+                                                       int c, int c_base, int c_count);
+__global__ void pack_nhwc_group_matrix_app_block_kernel(const float* __restrict__ src,
+                                                        float* __restrict__ dst,
+                                                        int n, int base_h, int base_w, int c,
+                                                        int ho_start_base, int wo_start_base,
+                                                        int block_ho_base, int block_wo_base,
+                                                        int ay, int ax,
+                                                        int c_base, int c_count);
+__global__ void pack_nhwc_group_matrix_app_block_rows_kernel(const float* __restrict__ src,
+                                                             float* __restrict__ dst,
+                                                             int n, int base_h, int base_w, int c,
+                                                             int ho_start_base, int wo_start_base,
+                                                             int block_ho_base, int block_wo_base,
+                                                             int ay, int ax,
+                                                             int row_start, int row_count,
+                                                             int c_base, int c_count);
+__global__ void unpack_matrix_to_nhwc_group_app_block_kernel(const float* __restrict__ src,
+                                                             float* __restrict__ dst,
+                                                             int n, int base_h, int base_w, int c,
+                                                             int ho_start_base, int wo_start_base,
+                                                             int block_ho_base, int block_wo_base,
+                                                             int ay, int ax,
+                                                             int c_base, int c_count);
 
 void ensure_packed_weights(Workspace& ws,
                            const float* d_w,
-                           int r, int s, int cin_group, int k, int groups) {
+                           int r, int s, int cin_group, int k, int groups, int ay, int ax) {
   const size_t kdim = static_cast<size_t>(r) * s * cin_group;
-  const size_t ncol = k / groups;
+  const size_t ncol = static_cast<size_t>(k / groups) * ay * ax;
   const size_t per_group = kdim * ncol;
   const size_t total = per_group * groups;
   ensure_capacity(&ws.d_wg_all, &ws.d_wg_all_cap, total);
@@ -141,15 +195,17 @@ void ensure_packed_weights(Workspace& ws,
       (ws.packed_s != s) ||
       (ws.packed_cin_group != cin_group) ||
       (ws.packed_k != k) ||
-      (ws.packed_groups != groups);
+      (ws.packed_groups != groups) ||
+      (ws.packed_ay != ay) ||
+      (ws.packed_ax != ax);
   if (!need_repack) return;
 
   const int t = 256;
   for (int g = 0; g < groups; ++g) {
-    const int kout_base = g * static_cast<int>(ncol);
+    const int kout_base = g * (k / groups);
     float* dst = ws.d_wg_all + g * per_group;
-    int blocks = static_cast<int>((per_group + t - 1) / t);
-    pack_filter_krsc_group_kernel<<<blocks, t>>>(d_w, dst, r, s, cin_group, kout_base, static_cast<int>(ncol));
+    const int blocks = static_cast<int>((per_group + t - 1) / t);
+    pack_filter_krsc_group_kernel<<<blocks, t>>>(d_w, dst, r, s, cin_group, ay, ax, kout_base, k / groups);
   }
   CUDA_CHECK(cudaGetLastError());
   ws.packed_w_src = d_w;
@@ -158,6 +214,8 @@ void ensure_packed_weights(Workspace& ws,
   ws.packed_cin_group = cin_group;
   ws.packed_k = k;
   ws.packed_groups = groups;
+  ws.packed_ay = ay;
+  ws.packed_ax = ax;
 }
 
 size_t packed_block_weight_offset(int groups, int by_count, int bx_count,
@@ -170,9 +228,9 @@ size_t packed_block_weight_offset(int groups, int by_count, int bx_count,
 void ensure_packed_block_weights(Workspace& ws,
                                  const float* d_w,
                                  int by_count, int bx_count,
-                                 int r, int s, int cin_group, int k, int groups) {
+                                 int r, int s, int cin_group, int k, int groups, int ay, int ax) {
   const size_t kdim = static_cast<size_t>(r) * s * cin_group;
-  const size_t ncol = k / groups;
+  const size_t ncol = static_cast<size_t>(k / groups) * ay * ax;
   const size_t per_group_slice = kdim * ncol;
   const size_t total = per_group_slice * groups * by_count * bx_count;
   ensure_capacity(&ws.d_block_wg_all, &ws.d_block_wg_all_cap, total);
@@ -185,21 +243,23 @@ void ensure_packed_block_weights(Workspace& ws,
       (ws.packed_block_s != s) ||
       (ws.packed_block_cin_group != cin_group) ||
       (ws.packed_block_k != k) ||
-      (ws.packed_block_groups != groups);
+      (ws.packed_block_groups != groups) ||
+      (ws.packed_block_ay != ay) ||
+      (ws.packed_block_ax != ax);
   if (!need_repack) return;
 
   const int t = 256;
   for (int g = 0; g < groups; ++g) {
-    const int kout_base = g * static_cast<int>(ncol);
+    const int kout_base = g * (k / groups);
     for (int by = 0; by < by_count; ++by) {
       for (int bx = 0; bx < bx_count; ++bx) {
         float* dst = ws.d_block_wg_all + packed_block_weight_offset(groups, by_count, bx_count, g, by, bx, per_group_slice);
         const int blocks = static_cast<int>((per_group_slice + t - 1) / t);
         pack_block_filter_kbybxrsc_group_kernel<<<blocks, t>>>(d_w, dst,
                                                                by_count, bx_count,
-                                                               r, s, cin_group,
+                                                               r, s, cin_group, ay, ax,
                                                                by, bx,
-                                                               kout_base, static_cast<int>(ncol));
+                                                               kout_base, k / groups);
       }
     }
   }
@@ -212,6 +272,8 @@ void ensure_packed_block_weights(Workspace& ws,
   ws.packed_block_cin_group = cin_group;
   ws.packed_block_k = k;
   ws.packed_block_groups = groups;
+  ws.packed_block_ay = ay;
+  ws.packed_block_ax = ax;
 }
 
 Workspace& workspace() {
@@ -318,6 +380,29 @@ __global__ void pack_nhwc_group_matrix_kernel(const float* __restrict__ src,
   dst[idx] = src[idx_nhwc(n_idx, h_idx, w_idx, c_base + col, h, w, c)];
 }
 
+__global__ void pack_nhwc_group_matrix_app_kernel(const float* __restrict__ src,
+                                                  float* __restrict__ dst,
+                                                  int n, int base_h, int base_w,
+                                                  int ay, int ax,
+                                                  int c, int c_base, int c_count) {
+  const int m = n * base_h * base_w;
+  const int ncol = c_count * ay * ax;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = m * ncol;
+  if (idx >= total) return;
+
+  const int row = idx / ncol;
+  const int ext_col = idx - row * ncol;
+
+  int ko, ay_idx, ax_idx;
+  decode_output_app_index(ext_col, ay, ax, ko, ay_idx, ax_idx);
+
+  int n_idx, ho_base, wo_base;
+  decode_conv_row(row, base_h, base_w, n_idx, ho_base, wo_base);
+  dst[idx] = src[idx_nhwc(n_idx, ho_base * ay + ay_idx, wo_base * ax + ax_idx,
+                          c_base + ko, base_h * ay, base_w * ax, c)];
+}
+
 __global__ void im2col_nhwc_rows_kernel(const float* __restrict__ x,
                                         float* __restrict__ col,
                                         int n, int h, int w, int c,
@@ -411,6 +496,31 @@ __global__ void pack_nhwc_group_matrix_rows_kernel(const float* __restrict__ src
   dst[idx] = src[idx_nhwc(n_idx, h_idx, w_idx, c_base + col, h, w, c)];
 }
 
+__global__ void pack_nhwc_group_matrix_app_rows_kernel(const float* __restrict__ src,
+                                                       float* __restrict__ dst,
+                                                       int n, int base_h, int base_w,
+                                                       int ay, int ax,
+                                                       int c,
+                                                       int row_start, int row_count,
+                                                       int c_base, int c_count) {
+  const int ncol = c_count * ay * ax;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = row_count * ncol;
+  if (idx >= total) return;
+
+  const int local_row = idx / ncol;
+  const int ext_col = idx - local_row * ncol;
+  const int row = row_start + local_row;
+
+  int ko, ay_idx, ax_idx;
+  decode_output_app_index(ext_col, ay, ax, ko, ay_idx, ax_idx);
+
+  int n_idx, ho_base, wo_base;
+  decode_conv_row(row, base_h, base_w, n_idx, ho_base, wo_base);
+  dst[idx] = src[idx_nhwc(n_idx, ho_base * ay + ay_idx, wo_base * ax + ax_idx,
+                          c_base + ko, base_h * ay, base_w * ax, c)];
+}
+
 __global__ void unpack_matrix_to_nhwc_group_kernel(const float* __restrict__ src,
                                                    float* __restrict__ dst,
                                                    int n, int h, int w, int c,
@@ -434,81 +544,46 @@ __global__ void unpack_matrix_to_nhwc_group_kernel(const float* __restrict__ src
 __global__ void pack_filter_krsc_group_kernel(const float* __restrict__ w,
                                               float* __restrict__ wg,
                                               int r, int s, int cin_group,
+                                              int ay, int ax,
                                               int k_base, int kout_group) {
   const int kdim = r * s * cin_group;
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int total = kout_group * kdim;
+  const int total = kout_group * ay * ax * kdim;
   if (idx >= total) return;
 
-  const int ko = idx / kdim;
-  const int k_idx = idx - ko * kdim;
+  const int ko_ext = idx / kdim;
+  const int k_idx = idx - ko_ext * kdim;
+  int ko = 0;
+  int ay_idx = 0;
+  int ax_idx = 0;
+  decode_output_app_index(ko_ext, ay, ax, ko, ay_idx, ax_idx);
 
   const int ci = k_idx % cin_group;
   const int t = k_idx / cin_group;
   const int ss = t % s;
   const int rr = t / s;
 
-  wg[idx] = w[idx_krsc(k_base + ko, rr, ss, ci, r, s, cin_group)];
+  wg[idx] = w[idx_krsc(k_base + ko, rr, ss, ci, ay_idx, ax_idx, r, s, cin_group, ay, ax)];
 }
 
 __global__ void unpack_filter_krsc_group_kernel(const float* __restrict__ wg,
                                                 float* __restrict__ w,
                                                 int r, int s, int cin_group,
+                                                int ay, int ax,
                                                 int k_total,
                                                 int k_base, int kout_group) {
   const int kdim = r * s * cin_group;
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int total = kdim * kout_group;
+  const int total = kdim * kout_group * ay * ax;
   if (idx >= total) return;
 
-  const int row = idx / kout_group;
-  const int col = idx - row * kout_group;
-
-  const int ci = row % cin_group;
-  const int t = row / cin_group;
-  const int ss = t % s;
-  const int rr = t / s;
-
-  w[idx_krsc(k_base + col, rr, ss, ci, r, s, cin_group)] = wg[idx];
-}
-
-__global__ void pack_block_filter_kbybxrsc_group_kernel(const float* __restrict__ w,
-                                                        float* __restrict__ wg,
-                                                        int by_count, int bx_count,
-                                                        int r, int s, int cin_group,
-                                                        int block_y, int block_x,
-                                                        int k_base, int kout_group) {
-  const int kdim = r * s * cin_group;
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int total = kout_group * kdim;
-  if (idx >= total) return;
-
-  const int ko = idx / kdim;
-  const int k_idx = idx - ko * kdim;
-
-  const int ci = k_idx % cin_group;
-  const int t = k_idx / cin_group;
-  const int ss = t % s;
-  const int rr = t / s;
-
-  wg[idx] = w[idx_kbybxrsc(k_base + ko, block_y, block_x, rr, ss, ci,
-                           by_count, bx_count, r, s, cin_group)];
-}
-
-__global__ void unpack_block_filter_kbybxrsc_group_kernel(const float* __restrict__ wg,
-                                                          float* __restrict__ w,
-                                                          int by_count, int bx_count,
-                                                          int r, int s, int cin_group,
-                                                          int block_y, int block_x,
-                                                          int k_total,
-                                                          int k_base, int kout_group) {
-  const int kdim = r * s * cin_group;
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int total = kdim * kout_group;
-  if (idx >= total) return;
-
-  const int row = idx / kout_group;
-  const int col = idx - row * kout_group;
+  const int ncol = kout_group * ay * ax;
+  const int row = idx / ncol;
+  const int col_ext = idx - row * ncol;
+  int ko = 0;
+  int ay_idx = 0;
+  int ax_idx = 0;
+  decode_output_app_index(col_ext, ay, ax, ko, ay_idx, ax_idx);
 
   const int ci = row % cin_group;
   const int t = row / cin_group;
@@ -516,8 +591,66 @@ __global__ void unpack_block_filter_kbybxrsc_group_kernel(const float* __restric
   const int rr = t / s;
 
   (void)k_total;
-  w[idx_kbybxrsc(k_base + col, block_y, block_x, rr, ss, ci,
-                 by_count, bx_count, r, s, cin_group)] = wg[idx];
+  w[idx_krsc(k_base + ko, rr, ss, ci, ay_idx, ax_idx, r, s, cin_group, ay, ax)] = wg[idx];
+}
+
+__global__ void pack_block_filter_kbybxrsc_group_kernel(const float* __restrict__ w,
+                                                        float* __restrict__ wg,
+                                                        int by_count, int bx_count,
+                                                        int r, int s, int cin_group,
+                                                        int ay, int ax,
+                                                        int block_y, int block_x,
+                                                        int k_base, int kout_group) {
+  const int kdim = r * s * cin_group;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = kout_group * ay * ax * kdim;
+  if (idx >= total) return;
+
+  const int ko_ext = idx / kdim;
+  const int k_idx = idx - ko_ext * kdim;
+  int ko = 0;
+  int ay_idx = 0;
+  int ax_idx = 0;
+  decode_output_app_index(ko_ext, ay, ax, ko, ay_idx, ax_idx);
+
+  const int ci = k_idx % cin_group;
+  const int t = k_idx / cin_group;
+  const int ss = t % s;
+  const int rr = t / s;
+
+  wg[idx] = w[idx_kbybxrsc(k_base + ko, block_y, block_x, rr, ss, ci, ay_idx, ax_idx,
+                           by_count, bx_count, r, s, cin_group, ay, ax)];
+}
+
+__global__ void unpack_block_filter_kbybxrsc_group_kernel(const float* __restrict__ wg,
+                                                          float* __restrict__ w,
+                                                          int by_count, int bx_count,
+                                                          int r, int s, int cin_group,
+                                                          int ay, int ax,
+                                                          int block_y, int block_x,
+                                                          int k_total,
+                                                          int k_base, int kout_group) {
+  const int kdim = r * s * cin_group;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = kdim * kout_group * ay * ax;
+  if (idx >= total) return;
+
+  const int ncol = kout_group * ay * ax;
+  const int row = idx / ncol;
+  const int col_ext = idx - row * ncol;
+  int ko = 0;
+  int ay_idx = 0;
+  int ax_idx = 0;
+  decode_output_app_index(col_ext, ay, ax, ko, ay_idx, ax_idx);
+
+  const int ci = row % cin_group;
+  const int t = row / cin_group;
+  const int ss = t % s;
+  const int rr = t / s;
+
+  (void)k_total;
+  w[idx_kbybxrsc(k_base + ko, block_y, block_x, rr, ss, ci, ay_idx, ax_idx,
+                 by_count, bx_count, r, s, cin_group, ay, ax)] = wg[idx];
 }
 
 __global__ void im2col_nhwc_block_kernel(const float* __restrict__ x,
@@ -581,6 +714,36 @@ __global__ void pack_nhwc_group_matrix_block_kernel(const float* __restrict__ sr
   const int lwo = rem - lho * block_wo;
 
   dst[idx] = src[idx_nhwc(n_idx, ho_start + lho, wo_start + lwo, c_base + col, h, w, c)];
+}
+
+__global__ void pack_nhwc_group_matrix_app_block_kernel(const float* __restrict__ src,
+                                                        float* __restrict__ dst,
+                                                        int n, int base_h, int base_w, int c,
+                                                        int ho_start_base, int wo_start_base,
+                                                        int block_ho_base, int block_wo_base,
+                                                        int ay, int ax,
+                                                        int c_base, int c_count) {
+  const int m = n * block_ho_base * block_wo_base;
+  const int ncol = c_count * ay * ax;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = m * ncol;
+  if (idx >= total) return;
+
+  const int row = idx / ncol;
+  const int ext_col = idx - row * ncol;
+
+  int ko, ay_idx, ax_idx;
+  decode_output_app_index(ext_col, ay, ax, ko, ay_idx, ax_idx);
+
+  const int n_idx = row / (block_ho_base * block_wo_base);
+  const int rem = row - n_idx * (block_ho_base * block_wo_base);
+  const int lho = rem / block_wo_base;
+  const int lwo = rem - lho * block_wo_base;
+  const int ho_base = ho_start_base + lho;
+  const int wo_base = wo_start_base + lwo;
+
+  dst[idx] = src[idx_nhwc(n_idx, ho_base * ay + ay_idx, wo_base * ax + ax_idx,
+                          c_base + ko, base_h * ay, base_w * ax, c)];
 }
 
 __global__ void im2col_nhwc_block_rows_kernel(const float* __restrict__ x,
@@ -647,6 +810,37 @@ __global__ void pack_nhwc_group_matrix_block_rows_kernel(const float* __restrict
   dst[idx] = src[idx_nhwc(n_idx, ho_start + lho, wo_start + lwo, c_base + col, h, w, c)];
 }
 
+__global__ void pack_nhwc_group_matrix_app_block_rows_kernel(const float* __restrict__ src,
+                                                             float* __restrict__ dst,
+                                                             int n, int base_h, int base_w, int c,
+                                                             int ho_start_base, int wo_start_base,
+                                                             int block_ho_base, int block_wo_base,
+                                                             int ay, int ax,
+                                                             int row_start, int row_count,
+                                                             int c_base, int c_count) {
+  const int ncol = c_count * ay * ax;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = row_count * ncol;
+  if (idx >= total) return;
+
+  const int local_row = idx / ncol;
+  const int ext_col = idx - local_row * ncol;
+  const int row = row_start + local_row;
+
+  int ko, ay_idx, ax_idx;
+  decode_output_app_index(ext_col, ay, ax, ko, ay_idx, ax_idx);
+
+  const int n_idx = row / (block_ho_base * block_wo_base);
+  const int rem = row - n_idx * (block_ho_base * block_wo_base);
+  const int lho = rem / block_wo_base;
+  const int lwo = rem - lho * block_wo_base;
+  const int ho_base = ho_start_base + lho;
+  const int wo_base = wo_start_base + lwo;
+
+  dst[idx] = src[idx_nhwc(n_idx, ho_base * ay + ay_idx, wo_base * ax + ax_idx,
+                          c_base + ko, base_h * ay, base_w * ax, c)];
+}
+
 __global__ void unpack_matrix_to_nhwc_group_block_kernel(const float* __restrict__ src,
                                                          float* __restrict__ dst,
                                                          int n, int h, int w, int c,
@@ -667,6 +861,36 @@ __global__ void unpack_matrix_to_nhwc_group_block_kernel(const float* __restrict
   const int lwo = rem - lho * block_wo;
 
   dst[idx_nhwc(n_idx, ho_start + lho, wo_start + lwo, c_base + col, h, w, c)] = src[idx];
+}
+
+__global__ void unpack_matrix_to_nhwc_group_app_block_kernel(const float* __restrict__ src,
+                                                             float* __restrict__ dst,
+                                                             int n, int base_h, int base_w, int c,
+                                                             int ho_start_base, int wo_start_base,
+                                                             int block_ho_base, int block_wo_base,
+                                                             int ay, int ax,
+                                                             int c_base, int c_count) {
+  const int m = n * block_ho_base * block_wo_base;
+  const int ncol = c_count * ay * ax;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = m * ncol;
+  if (idx >= total) return;
+
+  const int row = idx / ncol;
+  const int ext_col = idx - row * ncol;
+
+  int ko, ay_idx, ax_idx;
+  decode_output_app_index(ext_col, ay, ax, ko, ay_idx, ax_idx);
+
+  const int n_idx = row / (block_ho_base * block_wo_base);
+  const int rem = row - n_idx * (block_ho_base * block_wo_base);
+  const int lho = rem / block_wo_base;
+  const int lwo = rem - lho * block_wo_base;
+  const int ho_base = ho_start_base + lho;
+  const int wo_base = wo_start_base + lwo;
+
+  dst[idx_nhwc(n_idx, ho_base * ay + ay_idx, wo_base * ax + ax_idx,
+               c_base + ko, base_h * ay, base_w * ax, c)] = src[idx];
 }
 
 __global__ void col2im_accum_nhwc_block_kernel(const float* __restrict__ dcol,
@@ -1326,15 +1550,15 @@ void gather_output_block_nhwc(const float* d_src, float* d_dst,
 
 void launch_grad_gemm_tiled_group_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                                        int n, int h, int w, int c,
-                                       int ho, int wo,
+                                       int base_ho, int base_wo,
                                        int r, int s, int k,
                                        const Conv2DParams& p,
                                        int cin_base, int cin_group,
                                        int kout_base, int kout_group,
                                        bool can_vec4) {
-  const int m = n * ho * wo;
+  const int m = n * base_ho * base_wo;
   const int kdim = r * s * cin_group;
-  const int ncol = kout_group;
+  const int ncol = kout_group * p.ay * p.ax;
   const int rows_per_chunk = select_grad_gemm_rows_per_chunk(m, kdim, ncol);
 
   Workspace& ws = workspace();
@@ -1356,7 +1580,7 @@ void launch_grad_gemm_tiled_group_nhwc(const float* d_x, const float* d_dy, floa
       const int blocks_vec = (total_vec + t - 1) / t;
       im2col_nhwc_vec4_rows_kernel<<<blocks_vec, t>>>(d_x, d_col,
                                                       n, h, w, c,
-                                                      ho, wo,
+                                                      base_ho, base_wo,
                                                       row_start, row_count,
                                                       r, s,
                                                       p.pad_h, p.pad_w,
@@ -1368,7 +1592,7 @@ void launch_grad_gemm_tiled_group_nhwc(const float* d_x, const float* d_dy, floa
       const int blocks_col = (total_col + t - 1) / t;
       im2col_nhwc_rows_kernel<<<blocks_col, t>>>(d_x, d_col,
                                                  n, h, w, c,
-                                                 ho, wo,
+                                                 base_ho, base_wo,
                                                  row_start, row_count,
                                                  r, s,
                                                  p.pad_h, p.pad_w,
@@ -1379,10 +1603,10 @@ void launch_grad_gemm_tiled_group_nhwc(const float* d_x, const float* d_dy, floa
 
     const int total_dy = row_count * ncol;
     const int blocks_dy = (total_dy + t - 1) / t;
-    pack_nhwc_group_matrix_rows_kernel<<<blocks_dy, t>>>(d_dy, d_dy_mat,
-                                                          n, ho, wo, k,
-                                                          row_start, row_count,
-                                                          kout_base, kout_group);
+    pack_nhwc_group_matrix_app_rows_kernel<<<blocks_dy, t>>>(d_dy, d_dy_mat,
+                                                             n, base_ho, base_wo, p.ay, p.ax,
+                                                             k, row_start, row_count,
+                                                             kout_base, kout_group);
 
     bmm_matmul_accum(d_col, d_dy_mat, d_dwg,
                      1, kdim, ncol, row_count,
@@ -1391,24 +1615,25 @@ void launch_grad_gemm_tiled_group_nhwc(const float* d_x, const float* d_dy, floa
 
   const int total_wg = kdim * ncol;
   const int blocks_wg = (total_wg + t - 1) / t;
-  unpack_filter_krsc_group_kernel<<<blocks_wg, t>>>(d_dwg, d_dw, r, s, cin_group, k, kout_base, kout_group);
+  unpack_filter_krsc_group_kernel<<<blocks_wg, t>>>(d_dwg, d_dw, r, s, cin_group, p.ay, p.ax,
+                                                    k, kout_base, kout_group);
   CUDA_CHECK(cudaGetLastError());
 }
 
 void launch_block_grad_gemm_tiled_group_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                                              int n, int h, int w, int c,
-                                             int ho, int wo,
-                                             int ho_start, int wo_start,
-                                             int block_ho, int block_wo,
+                                             int base_ho, int base_wo,
+                                             int ho_start_base, int wo_start_base,
+                                             int block_ho_base, int block_wo_base,
                                              int by_count, int bx_count,
                                              int r, int s, int k,
                                              const Conv2DParams& p,
                                              int cin_base, int cin_group,
                                              int kout_base, int kout_group,
                                              int by, int bx) {
-  const int m = n * block_ho * block_wo;
+  const int m = n * block_ho_base * block_wo_base;
   const int kdim = r * s * cin_group;
-  const int ncol = kout_group;
+  const int ncol = kout_group * p.ay * p.ax;
   const int rows_per_chunk = select_grad_gemm_rows_per_chunk(m, kdim, ncol);
 
   Workspace& ws = workspace();
@@ -1428,8 +1653,8 @@ void launch_block_grad_gemm_tiled_group_nhwc(const float* d_x, const float* d_dy
     const int blocks_col = (total_col + t - 1) / t;
     im2col_nhwc_block_rows_kernel<<<blocks_col, t>>>(d_x, d_col,
                                                      n, h, w, c,
-                                                     ho_start, wo_start,
-                                                     block_ho, block_wo,
+                                                     ho_start_base, wo_start_base,
+                                                     block_ho_base, block_wo_base,
                                                      row_start, row_count,
                                                      r, s,
                                                      p.pad_h, p.pad_w,
@@ -1439,12 +1664,13 @@ void launch_block_grad_gemm_tiled_group_nhwc(const float* d_x, const float* d_dy
 
     const int total_dy = row_count * ncol;
     const int blocks_dy = (total_dy + t - 1) / t;
-    pack_nhwc_group_matrix_block_rows_kernel<<<blocks_dy, t>>>(d_dy, d_dy_mat,
-                                                                n, ho, wo, k,
-                                                                ho_start, wo_start,
-                                                                block_ho, block_wo,
-                                                                row_start, row_count,
-                                                                kout_base, kout_group);
+    pack_nhwc_group_matrix_app_block_rows_kernel<<<blocks_dy, t>>>(d_dy, d_dy_mat,
+                                                                   n, base_ho, base_wo, k,
+                                                                   ho_start_base, wo_start_base,
+                                                                   block_ho_base, block_wo_base,
+                                                                   p.ay, p.ax,
+                                                                   row_start, row_count,
+                                                                   kout_base, kout_group);
 
     bmm_matmul_accum(d_col, d_dy_mat, d_dwg,
                      1, kdim, ncol, row_count,
@@ -1455,7 +1681,7 @@ void launch_block_grad_gemm_tiled_group_nhwc(const float* d_x, const float* d_dy
   const int blocks_wg = (total_wg + t - 1) / t;
   unpack_block_filter_kbybxrsc_group_kernel<<<blocks_wg, t>>>(d_dwg, d_dw,
                                                               by_count, bx_count,
-                                                              r, s, cin_group,
+                                                              r, s, cin_group, p.ay, p.ax,
                                                               by, bx,
                                                               k,
                                                               kout_base, kout_group);
@@ -1518,18 +1744,18 @@ void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
                        int n, int h, int w, int c, int r, int s, int k,
                        const Conv2DParams& p) {
   TensorNHWC x_shape(n, h, w, c);
-  FilterKRSC w_shape(r, s, c / p.groups, k);
+  FilterKRSC w_shape(r, s, c / p.groups, k, p.ay, p.ax);
   ConvShape sh = infer_conv_shape(x_shape, w_shape, p);
 
-  const int m = n * sh.ho * sh.wo;
+  const int m = n * sh.base_ho * sh.base_wo;
   const int kdim = r * s * sh.cin_group;
-  const int ncol = sh.kout_group;
+  const int ncol = sh.kout_group * p.ay * p.ax;
   const bool can_vec4 = (sh.cin_group % 4 == 0) && (sh.cin_group >= 4) && ((c % 4) == 0);
 
   Workspace& ws = workspace();
   ensure_capacity(&ws.d_col, &ws.d_col_cap, static_cast<size_t>(m) * kdim);
   ensure_capacity(&ws.d_ymat, &ws.d_ymat_cap, static_cast<size_t>(m) * ncol);
-  ensure_packed_weights(ws, d_w, r, s, sh.cin_group, k, p.groups);
+  ensure_packed_weights(ws, d_w, r, s, sh.cin_group, k, p.groups, p.ay, p.ax);
   float* d_col = ws.d_col;
   float* d_ymat = ws.d_ymat;
 
@@ -1544,7 +1770,7 @@ void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
       const int total_vec = m * r * s * (sh.cin_group / 4);
       const int blocks_vec = (total_vec + t - 1) / t;
       im2col_nhwc_vec4_kernel<<<blocks_vec, t>>>(d_x, d_col, n, h, w, c,
-                                                 sh.ho, sh.wo,
+                                                 sh.base_ho, sh.base_wo,
                                                  r, s,
                                                  p.pad_h, p.pad_w,
                                                  p.stride_h, p.stride_w,
@@ -1552,7 +1778,7 @@ void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
                                                  cin_base, sh.cin_group);
     } else {
       im2col_nhwc_kernel<<<blocks_col, t>>>(d_x, d_col, n, h, w, c,
-                                            sh.ho, sh.wo,
+                                            sh.base_ho, sh.base_wo,
                                             r, s,
                                             p.pad_h, p.pad_w,
                                             p.stride_h, p.stride_w,
@@ -1566,7 +1792,9 @@ void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
 
     int total_ym = m * ncol;
     int blocks_ym = (total_ym + t - 1) / t;
-    unpack_matrix_to_nhwc_group_kernel<<<blocks_ym, t>>>(d_ymat, d_y, n, sh.ho, sh.wo, k, kout_base, sh.kout_group);
+    unpack_matrix_to_nhwc_group_app_kernel<<<blocks_ym, t>>>(d_ymat, d_y,
+                                                             n, sh.base_ho, sh.base_wo, p.ay, p.ax,
+                                                             k, kout_base, sh.kout_group);
   }
 
   CUDA_CHECK(cudaGetLastError());
@@ -1576,17 +1804,17 @@ void launch_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
                        int n, int h, int w, int c, int r, int s, int k,
                        const Conv2DParams& p) {
   TensorNHWC x_shape(n, h, w, c);
-  FilterKRSC w_shape(r, s, c / p.groups, k);
+  FilterKRSC w_shape(r, s, c / p.groups, k, p.ay, p.ax);
   ConvShape sh = infer_conv_shape(x_shape, w_shape, p);
 
-  const int m = n * sh.ho * sh.wo;
+  const int m = n * sh.base_ho * sh.base_wo;
   const int kdim = r * s * sh.cin_group;
-  const int ncol = sh.kout_group;
+  const int ncol = sh.kout_group * p.ay * p.ax;
 
   Workspace& ws = workspace();
   ensure_capacity(&ws.d_dy_mat, &ws.d_dy_mat_cap, static_cast<size_t>(m) * ncol);
   ensure_capacity(&ws.d_dcol, &ws.d_dcol_cap, static_cast<size_t>(m) * kdim);
-  ensure_packed_weights(ws, d_w, r, s, sh.cin_group, k, p.groups);
+  ensure_packed_weights(ws, d_w, r, s, sh.cin_group, k, p.groups, p.ay, p.ax);
   float* d_dy_mat = ws.d_dy_mat;
   float* d_dcol = ws.d_dcol;
 
@@ -1600,7 +1828,9 @@ void launch_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
 
     int total_dy = m * ncol;
     int blocks_dy = (total_dy + t - 1) / t;
-    pack_nhwc_group_matrix_kernel<<<blocks_dy, t>>>(d_dy, d_dy_mat, n, sh.ho, sh.wo, k, kout_base, sh.kout_group);
+    pack_nhwc_group_matrix_app_kernel<<<blocks_dy, t>>>(d_dy, d_dy_mat,
+                                                        n, sh.base_ho, sh.base_wo, p.ay, p.ax,
+                                                        k, kout_base, sh.kout_group);
 
     float* d_wg = ws.d_wg_all + static_cast<size_t>(g) * ncol * kdim;
     // Input-gradient GEMM: [m, ncol] @ [ncol, kdim] -> [m, kdim]
@@ -1610,7 +1840,7 @@ void launch_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
     int blocks_dcol = (total_dcol + t - 1) / t;
     col2im_accum_nhwc_kernel<<<blocks_dcol, t>>>(d_dcol, d_dx,
                                                  n, h, w, c,
-                                                 sh.ho, sh.wo,
+                                                 sh.base_ho, sh.base_wo,
                                                  r, s,
                                                  p.pad_h, p.pad_w,
                                                  p.stride_h, p.stride_w,
@@ -1626,11 +1856,15 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                       const Conv2DParams& p,
                       GradKernelAlgo algo) {
   TensorNHWC x_shape(n, h, w, c);
-  FilterKRSC w_shape(r, s, c / p.groups, k);
+  FilterKRSC w_shape(r, s, c / p.groups, k, p.ay, p.ax);
   ConvShape sh = infer_conv_shape(x_shape, w_shape, p);
 
+  if ((p.ay != 1 || p.ax != 1) && algo != GradKernelAlgo::GemmIm2Col) {
+    throw std::runtime_error("Ay/Ax currently support only grad_algo=gemm");
+  }
+
   if (algo == GradKernelAlgo::Algo0Atomic) {
-    CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(r) * s * sh.cin_group * k * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(r) * s * sh.cin_group * k * p.ay * p.ax * sizeof(float)));
     const size_t total = static_cast<size_t>(n) * sh.ho * sh.wo * k;
     const int t = 256;
     const int blocks = static_cast<int>(std::min<size_t>((total + t - 1) / t, 65535));
@@ -1647,8 +1881,8 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
   }
 
   if (algo == GradKernelAlgo::Algo1Deterministic) {
-    const int m = n * sh.ho * sh.wo;
-    const int slice_weights = r * s * sh.cin_group * sh.kout_group;
+    const int m = n * sh.base_ho * sh.base_wo;
+    const int slice_weights = r * s * sh.cin_group * sh.kout_group * p.ay * p.ax;
     const int packed_weights = r * s * sh.cin_group *
                                ((sh.kout_group + kGradSplitKOutputsPerWarp - 1) / kGradSplitKOutputsPerWarp);
     const int split_k = select_grad_split_k(m, static_cast<size_t>(slice_weights));
@@ -1667,7 +1901,7 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
       const int kout_base = g * sh.kout_group;
       grad_filter_algo1_splitk_partials_nhwc_kernel<<<grid, block>>>(d_x, d_dy, ws.d_grad_partials,
                                                                       n, h, w, c,
-                                                                      sh.ho, sh.wo,
+                                                                      sh.base_ho, sh.base_wo,
                                                                       r, s, k,
                                                                       p.pad_h, p.pad_w,
                                                                       p.stride_h, p.stride_w,
@@ -1676,14 +1910,15 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                                                                       kout_base, sh.kout_group,
                                                                       rows_per_chunk);
       reduce_grad_splitk_partials_kernel<<<reduce_blocks, 256>>>(ws.d_grad_partials, ws.d_dwg, split_k, slice_weights);
-      unpack_filter_krsc_group_kernel<<<reduce_blocks, 256>>>(ws.d_dwg, d_dw, r, s, sh.cin_group, k, kout_base, sh.kout_group);
+      unpack_filter_krsc_group_kernel<<<reduce_blocks, 256>>>(ws.d_dwg, d_dw, r, s, sh.cin_group, p.ay, p.ax,
+                                                              k, kout_base, sh.kout_group);
     }
     CUDA_CHECK(cudaGetLastError());
     return;
   }
 
   if (algo == GradKernelAlgo::Algo2TiledAtomic) {
-    CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(r) * s * sh.cin_group * k * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(r) * s * sh.cin_group * k * p.ay * p.ax * sizeof(float)));
 
     const int kdim = r * s * sh.cin_group;
     const dim3 block(kGradTileKOut, kGradTileKDim);
@@ -1697,7 +1932,7 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
       const int kout_base = g * sh.kout_group;
       grad_filter_tiled_atomic_nhwc_kernel<<<grid, block, shared_bytes>>>(d_x, d_dy, d_dw,
                                                                            n, h, w, c,
-                                                                           sh.ho, sh.wo,
+                                                                           sh.base_ho, sh.base_wo,
                                                                            r, s, k,
                                                                            p.pad_h, p.pad_w,
                                                                            p.stride_h, p.stride_w,
@@ -1711,14 +1946,14 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
 
   const bool can_vec4 = (sh.cin_group % 4 == 0) && (sh.cin_group >= 4) && (c % 4 == 0);
 
-  CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(r) * s * sh.cin_group * k * sizeof(float)));
+  CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(r) * s * sh.cin_group * k * p.ay * p.ax * sizeof(float)));
 
   for (int g = 0; g < p.groups; ++g) {
     const int cin_base = g * sh.cin_group;
     const int kout_base = g * sh.kout_group;
     launch_grad_gemm_tiled_group_nhwc(d_x, d_dy, d_dw,
                                       n, h, w, c,
-                                      sh.ho, sh.wo,
+                                      sh.base_ho, sh.base_wo,
                                       r, s, k,
                                       p,
                                       cin_base, sh.cin_group,
@@ -1733,18 +1968,18 @@ void launch_block_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
                              int n, int h, int w, int c, int r, int s, int k,
                              const BlockConv2DParams& p) {
   TensorNHWC x_shape(n, h, w, c);
-  BlockFilterKByBxRSC w_shape(k, p.block_by, p.block_bx, r, s, c / p.conv.groups);
+  BlockFilterKByBxRSC w_shape(k, p.block_by, p.block_bx, r, s, c / p.conv.groups, p.conv.ay, p.conv.ax);
   const BlockConvShape sh = infer_block_conv_shape(x_shape, w_shape, p);
 
   const int m_block = n * sh.block_ho * sh.block_wo;
   const int kdim = r * s * sh.base.cin_group;
-  const int ncol = sh.base.kout_group;
+  const int ncol = sh.base.kout_group * p.conv.ay * p.conv.ax;
   const size_t per_group_slice = static_cast<size_t>(kdim) * ncol;
 
   Workspace& ws = workspace();
   ensure_capacity(&ws.d_col, &ws.d_col_cap, static_cast<size_t>(m_block) * kdim);
   ensure_capacity(&ws.d_ymat, &ws.d_ymat_cap, static_cast<size_t>(m_block) * ncol);
-  ensure_packed_block_weights(ws, d_w, p.block_by, p.block_bx, r, s, sh.base.cin_group, k, p.conv.groups);
+  ensure_packed_block_weights(ws, d_w, p.block_by, p.block_bx, r, s, sh.base.cin_group, k, p.conv.groups, p.conv.ay, p.conv.ax);
   float* d_col = ws.d_col;
   float* d_ymat = ws.d_ymat;
 
@@ -1774,11 +2009,12 @@ void launch_block_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
 
         const int total_ym = m_block * ncol;
         const int blocks_ym = (total_ym + t - 1) / t;
-        unpack_matrix_to_nhwc_group_block_kernel<<<blocks_ym, t>>>(d_ymat, d_y,
-                                                                   n, sh.base.ho, sh.base.wo, k,
-                                                                   ho_start, wo_start,
-                                                                   sh.block_ho, sh.block_wo,
-                                                                   kout_base, sh.base.kout_group);
+        unpack_matrix_to_nhwc_group_app_block_kernel<<<blocks_ym, t>>>(d_ymat, d_y,
+                                                                       n, sh.base.base_ho, sh.base.base_wo, k,
+                                                                       ho_start, wo_start,
+                                                                       sh.block_ho, sh.block_wo,
+                                                                       p.conv.ay, p.conv.ax,
+                                                                       kout_base, sh.base.kout_group);
       }
     }
   }
@@ -1790,18 +2026,18 @@ void launch_block_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
                              int n, int h, int w, int c, int r, int s, int k,
                              const BlockConv2DParams& p) {
   TensorNHWC x_shape(n, h, w, c);
-  BlockFilterKByBxRSC w_shape(k, p.block_by, p.block_bx, r, s, c / p.conv.groups);
+  BlockFilterKByBxRSC w_shape(k, p.block_by, p.block_bx, r, s, c / p.conv.groups, p.conv.ay, p.conv.ax);
   const BlockConvShape sh = infer_block_conv_shape(x_shape, w_shape, p);
 
   const int m_block = n * sh.block_ho * sh.block_wo;
   const int kdim = r * s * sh.base.cin_group;
-  const int ncol = sh.base.kout_group;
+  const int ncol = sh.base.kout_group * p.conv.ay * p.conv.ax;
   const size_t per_group_slice = static_cast<size_t>(kdim) * ncol;
 
   Workspace& ws = workspace();
   ensure_capacity(&ws.d_dy_mat, &ws.d_dy_mat_cap, static_cast<size_t>(m_block) * ncol);
   ensure_capacity(&ws.d_dcol, &ws.d_dcol_cap, static_cast<size_t>(m_block) * kdim);
-  ensure_packed_block_weights(ws, d_w, p.block_by, p.block_bx, r, s, sh.base.cin_group, k, p.conv.groups);
+  ensure_packed_block_weights(ws, d_w, p.block_by, p.block_bx, r, s, sh.base.cin_group, k, p.conv.groups, p.conv.ay, p.conv.ax);
   float* d_dy_mat = ws.d_dy_mat;
   float* d_dcol = ws.d_dcol;
 
@@ -1817,11 +2053,12 @@ void launch_block_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
         const int wo_start = bx * sh.block_wo;
         const int total_dy = m_block * ncol;
         const int blocks_dy = (total_dy + t - 1) / t;
-        pack_nhwc_group_matrix_block_kernel<<<blocks_dy, t>>>(d_dy, d_dy_mat,
-                                                              n, sh.base.ho, sh.base.wo, k,
-                                                              ho_start, wo_start,
-                                                              sh.block_ho, sh.block_wo,
-                                                              kout_base, sh.base.kout_group);
+        pack_nhwc_group_matrix_app_block_kernel<<<blocks_dy, t>>>(d_dy, d_dy_mat,
+                                                                  n, sh.base.base_ho, sh.base.base_wo, k,
+                                                                  ho_start, wo_start,
+                                                                  sh.block_ho, sh.block_wo,
+                                                                  p.conv.ay, p.conv.ax,
+                                                                  kout_base, sh.base.kout_group);
 
         float* d_wg = ws.d_block_wg_all + packed_block_weight_offset(p.conv.groups, p.block_by, p.block_bx,
                                                                      g, by, bx, per_group_slice);
@@ -1850,11 +2087,15 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                             const BlockConv2DParams& p,
                             GradKernelAlgo algo) {
   TensorNHWC x_shape(n, h, w, c);
-  BlockFilterKByBxRSC w_shape(k, p.block_by, p.block_bx, r, s, c / p.conv.groups);
+  BlockFilterKByBxRSC w_shape(k, p.block_by, p.block_bx, r, s, c / p.conv.groups, p.conv.ay, p.conv.ax);
   const BlockConvShape sh = infer_block_conv_shape(x_shape, w_shape, p);
 
+  if ((p.conv.ay != 1 || p.conv.ax != 1) && algo != GradKernelAlgo::GemmIm2Col) {
+    throw std::runtime_error("Ay/Ax currently support only grad_algo=gemm");
+  }
+
   if (algo == GradKernelAlgo::Algo0Atomic) {
-    CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(k) * p.block_by * p.block_bx * r * s * sh.base.cin_group * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(k) * p.block_by * p.block_bx * r * s * sh.base.cin_group * p.conv.ay * p.conv.ax * sizeof(float)));
     const size_t total = static_cast<size_t>(n) * sh.base.ho * sh.base.wo * k;
     const int t = 256;
     const int blocks = static_cast<int>(std::min<size_t>((total + t - 1) / t, 65535));
@@ -1874,7 +2115,7 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
 
   if (algo == GradKernelAlgo::Algo1Deterministic) {
     const int m_block = n * sh.block_ho * sh.block_wo;
-    const int slice_weights = r * s * sh.base.cin_group * sh.base.kout_group;
+    const int slice_weights = r * s * sh.base.cin_group * sh.base.kout_group * p.conv.ay * p.conv.ax;
     const int packed_weights = r * s * sh.base.cin_group *
                                ((sh.base.kout_group + kGradSplitKOutputsPerWarp - 1) / kGradSplitKOutputsPerWarp);
     const int split_k = select_grad_split_k(m_block, static_cast<size_t>(slice_weights));
@@ -1910,7 +2151,7 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
           reduce_grad_splitk_partials_kernel<<<reduce_blocks, 256>>>(ws.d_grad_partials, ws.d_dwg, split_k, slice_weights);
           unpack_block_filter_kbybxrsc_group_kernel<<<reduce_blocks, 256>>>(ws.d_dwg, d_dw,
                                                                             p.block_by, p.block_bx,
-                                                                            r, s, sh.base.cin_group,
+                                                                            r, s, sh.base.cin_group, p.conv.ay, p.conv.ax,
                                                                             by, bx,
                                                                             k,
                                                                             kout_base, sh.base.kout_group);
@@ -1922,7 +2163,7 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
   }
 
   if (algo == GradKernelAlgo::Algo2TiledAtomic) {
-    CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(k) * p.block_by * p.block_bx * r * s * sh.base.cin_group * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(k) * p.block_by * p.block_bx * r * s * sh.base.cin_group * p.conv.ay * p.conv.ax * sizeof(float)));
 
     const int kdim = r * s * sh.base.cin_group;
     const dim3 block(kGradTileKOut, kGradTileKDim);
@@ -1957,7 +2198,7 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
     return;
   }
 
-  CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(k) * p.block_by * p.block_bx * r * s * sh.base.cin_group * sizeof(float)));
+  CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(k) * p.block_by * p.block_bx * r * s * sh.base.cin_group * p.conv.ay * p.conv.ax * sizeof(float)));
   for (int g = 0; g < p.conv.groups; ++g) {
     const int cin_base = g * sh.base.cin_group;
     const int kout_base = g * sh.base.kout_group;
@@ -1967,7 +2208,7 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
         const int wo_start = bx * sh.block_wo;
         launch_block_grad_gemm_tiled_group_nhwc(d_x, d_dy, d_dw,
                                                 n, h, w, c,
-                                                sh.base.ho, sh.base.wo,
+                                                sh.base.base_ho, sh.base.base_wo,
                                                 ho_start, wo_start,
                                                 sh.block_ho, sh.block_wo,
                                                 p.block_by, p.block_bx,
@@ -2159,6 +2400,29 @@ __global__ void unpack_matrix_to_nhwc_group_i32_kernel(const int32_t* __restrict
   dst[idx_nhwc(n_idx, h_idx, w_idx, c_base + col, h, w, c)] = src[idx];
 }
 
+__global__ void unpack_matrix_to_nhwc_group_app_kernel(const float* __restrict__ src,
+                                                       float* __restrict__ dst,
+                                                       int n, int base_h, int base_w,
+                                                       int ay, int ax,
+                                                       int c, int c_base, int c_count) {
+  const int m = n * base_h * base_w;
+  const int ncol = c_count * ay * ax;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = m * ncol;
+  if (idx >= total) return;
+
+  const int row = idx / ncol;
+  const int ext_col = idx - row * ncol;
+
+  int ko, ay_idx, ax_idx;
+  decode_output_app_index(ext_col, ay, ax, ko, ay_idx, ax_idx);
+
+  int n_idx, ho_base, wo_base;
+  decode_conv_row(row, base_h, base_w, n_idx, ho_base, wo_base);
+  dst[idx_nhwc(n_idx, ho_base * ay + ay_idx, wo_base * ax + ax_idx,
+               c_base + ko, base_h * ay, base_w * ax, c)] = src[idx];
+}
+
 __global__ void unpack_matrix_to_nhwc_group_block_i32_kernel(const int32_t* __restrict__ src,
                                                              int32_t* __restrict__ dst,
                                                              int n, int h, int w, int c,
@@ -2187,6 +2451,9 @@ void launch_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, int32_t* d_
                                  const Conv2DParams& p,
                                  const nnalgebra::QuantizationParameters<Tin>* in_qp,
                                  const nnalgebra::QuantizationParameters<Tin>* f_qp) {
+  if (p.ay != 1 || p.ax != 1) {
+    throw std::runtime_error("quantized NHWC fprop does not support ay/ax != 1");
+  }
   TensorNHWC x_shape(n, h, w, c);
   FilterKRSC w_shape(r, s, c / p.groups, k);
   const ConvShape sh = infer_conv_shape(x_shape, w_shape, p);
@@ -2245,6 +2512,9 @@ void launch_block_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, int32
                                        const BlockConv2DParams& p,
                                        const nnalgebra::QuantizationParameters<Tin>* in_qp,
                                        const nnalgebra::QuantizationParameters<Tin>* f_qp) {
+  if (p.conv.ay != 1 || p.conv.ax != 1) {
+    throw std::runtime_error("quantized blocked NHWC fprop does not support ay/ax != 1");
+  }
   TensorNHWC x_shape(n, h, w, c);
   BlockFilterKByBxRSC w_shape(k, p.block_by, p.block_bx, r, s, c / p.conv.groups);
   const BlockConvShape sh = infer_block_conv_shape(x_shape, w_shape, p);
