@@ -86,6 +86,26 @@ set_target_properties(conv_grad_check PROPERTIES
   CXX_STANDARD_REQUIRED ON
 )
 
+add_executable(conv_chain_test
+  bmm.cu
+  conv_chain_test.cu
+  src/cpu_ref.cpp
+  src/cuda_kernels.cu
+  src/cuda_utils.cpp
+  src/verify.cpp
+)
+
+configure_cuda_target(conv_chain_test)
+
+add_executable(conv_large_workspace_test
+  bmm.cu
+  conv_large_workspace_test.cu
+  src/cuda_kernels.cu
+  src/cuda_utils.cpp
+)
+
+configure_cuda_target(conv_large_workspace_test)
+
 if(ENABLE_CUDNN)
   set(CUDNN_ROOT_HINTS
     $ENV{CUDNN_ROOT}
@@ -177,4 +197,10 @@ if(BUILD_TESTING)
 
   add_test(NAME conv_grad_check_128x128 COMMAND conv_grad_check)
   set_tests_properties(conv_grad_check_128x128 PROPERTIES LABELS "conv;grad")
+
+  add_test(NAME conv_chain_test COMMAND $<TARGET_FILE:conv_chain_test>)
+  set_tests_properties(conv_chain_test PROPERTIES LABELS "conv;fprop;regression")
+
+  add_test(NAME conv_large_workspace_test COMMAND $<TARGET_FILE:conv_large_workspace_test>)
+  set_tests_properties(conv_large_workspace_test PROPERTIES LABELS "conv;memory;regression")
 endif()
