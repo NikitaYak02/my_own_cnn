@@ -34,6 +34,7 @@ endfunction()
 add_executable(conv_bench
   bmm.cu
   src/main.cpp
+  src/conv_layer.cu
   src/cpu_ref.cpp
   src/cuda_kernels.cu
   src/cuda_utils.cpp
@@ -75,6 +76,16 @@ add_executable(quant_conv_test
 
 configure_cuda_target(quant_conv_test)
 
+add_executable(quant_error_u8
+  bmm.cu
+  quant_error_u8.cu
+  src/cpu_ref.cpp
+  src/cuda_kernels.cu
+  src/cuda_utils.cpp
+)
+
+configure_cuda_target(quant_error_u8)
+
 add_executable(conv_grad_check
   conv_grad_check.cpp
   src/cpu_ref.cpp
@@ -105,6 +116,18 @@ add_executable(conv_large_workspace_test
 )
 
 configure_cuda_target(conv_large_workspace_test)
+
+add_executable(conv_layer_test
+  bmm.cu
+  conv_layer_test.cu
+  src/conv_layer.cu
+  src/cpu_ref.cpp
+  src/cuda_kernels.cu
+  src/cuda_utils.cpp
+  src/verify.cpp
+)
+
+configure_cuda_target(conv_layer_test)
 
 if(ENABLE_CUDNN)
   set(CUDNN_ROOT_HINTS
@@ -203,4 +226,7 @@ if(BUILD_TESTING)
 
   add_test(NAME conv_large_workspace_test COMMAND $<TARGET_FILE:conv_large_workspace_test>)
   set_tests_properties(conv_large_workspace_test PROPERTIES LABELS "conv;memory;regression")
+
+  add_test(NAME conv_layer_test COMMAND $<TARGET_FILE:conv_layer_test>)
+  set_tests_properties(conv_layer_test PROPERTIES LABELS "conv;train;regression")
 endif()

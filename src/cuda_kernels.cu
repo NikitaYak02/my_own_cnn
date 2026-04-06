@@ -311,6 +311,30 @@ Workspace& workspace() {
   return ws;
 }
 
+}  // namespace
+
+void invalidate_conv_weight_cache(const float* d_w) {
+  Workspace& ws = workspace();
+  if (ws.packed_w_src == d_w) {
+    ws.packed_w_src = nullptr;
+  }
+}
+
+void invalidate_block_conv_weight_cache(const float* d_w) {
+  Workspace& ws = workspace();
+  if (ws.packed_block_w_src == d_w) {
+    ws.packed_block_w_src = nullptr;
+  }
+}
+
+void invalidate_all_conv_workspace_caches() {
+  Workspace& ws = workspace();
+  ws.packed_w_src = nullptr;
+  ws.packed_block_w_src = nullptr;
+}
+
+namespace {
+
 __global__ void im2col_nhwc_kernel(const float* __restrict__ x,
                                    float* __restrict__ col,
                                    int n, int h, int w, int c,

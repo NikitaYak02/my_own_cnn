@@ -337,6 +337,10 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                             const BlockConv2DParams& p,
                             GradKernelAlgo algo = GradKernelAlgo::GemmIm2Col);
 
+void invalidate_conv_weight_cache(const float* d_w);
+void invalidate_block_conv_weight_cache(const float* d_w);
+void invalidate_all_conv_workspace_caches();
+
 template <nnalgebra::DataType Tin>
 inline void launch_fprop_nhwc_qi32(const float* d_x, const float* d_w, int32_t* d_y,
                                    int n, int h, int w, int c, int r, int s, int k,
