@@ -97,6 +97,14 @@ void run_regular_case() {
   cpu_grad_nhwc(x, dy, p, dw_ref);
 
   Conv2DLayer layer(n, h, w, c, weights, p);
+  if (!layer.regular_config() || layer.blocked_config()) {
+    throw std::runtime_error("regular layer config exposure is invalid");
+  }
+  if (layer.regular_config()->shape.ho != y_ref.h ||
+      layer.regular_config()->shape.wo != y_ref.w ||
+      layer.regular_config()->output_elements != y_ref.elements()) {
+    throw std::runtime_error("regular runtime config mismatch");
+  }
 
   DeviceBuffer<float> d_x;
   DeviceBuffer<float> d_dy;
@@ -179,6 +187,14 @@ void run_blocked_case() {
   cpu_block_grad_nhwc(x, dy, p, dw_ref);
 
   Conv2DLayer layer(n, h, w, c, weights, p);
+  if (!layer.blocked_config() || layer.regular_config()) {
+    throw std::runtime_error("blocked layer config exposure is invalid");
+  }
+  if (layer.blocked_config()->shape.base.ho != y_ref.h ||
+      layer.blocked_config()->shape.base.wo != y_ref.w ||
+      layer.blocked_config()->output_elements != y_ref.elements()) {
+    throw std::runtime_error("blocked runtime config mismatch");
+  }
 
   DeviceBuffer<float> d_x;
   DeviceBuffer<float> d_dy;

@@ -65,52 +65,9 @@ constexpr int kGradSplitKBlockSize = 256;
 constexpr int kGradSplitKWarpSize = 32;
 constexpr int kGradSplitKWarpsPerBlock = kGradSplitKBlockSize / kGradSplitKWarpSize;
 constexpr int kGradSplitKOutputsPerWarp = 4;
-constexpr int kGradSplitKTargetRowsPerChunk = 2048;
-constexpr int kGradSplitKMaxChunks = 16;
-constexpr size_t kGradSplitKMaxPartialElements = 8ull * 1024ull * 1024ull;
 constexpr int kGradTileRows = 64;
 constexpr int kGradTileKDim = 8;
 constexpr int kGradTileKOut = 8;
-constexpr size_t kGradGemmTileTargetBytes = 64ull * 1024ull * 1024ull;
-constexpr int kGradGemmMinRowsPerChunk = 2048;
-constexpr size_t kConvScratchTargetBytes = 96ull * 1024ull * 1024ull;
-constexpr int kConvMinRowsPerChunk = 1024;
-
-int select_grad_split_k(int rows, size_t slice_weights) {
-  if (rows <= 0 || slice_weights == 0) return 1;
-
-  int split_k = std::max(1, (rows + kGradSplitKTargetRowsPerChunk - 1) / kGradSplitKTargetRowsPerChunk);
-  split_k = std::min(split_k, kGradSplitKMaxChunks);
-
-  const size_t max_by_memory = std::max<size_t>(1, kGradSplitKMaxPartialElements / slice_weights);
-  split_k = std::min(split_k, static_cast<int>(max_by_memory));
-  return std::max(1, split_k);
-}
-
-int select_grad_gemm_rows_per_chunk(int rows, int kdim, int ncol) {
-  if (rows <= 0) return 1;
-  const size_t row_bytes = static_cast<size_t>(kdim + ncol) * sizeof(float);
-  if (row_bytes == 0) return rows;
-
-  int chunk_rows = static_cast<int>(kGradGemmTileTargetBytes / row_bytes);
-  chunk_rows = std::max(kGradGemmMinRowsPerChunk, chunk_rows);
-  chunk_rows = std::min(chunk_rows, rows);
-  return std::max(1, chunk_rows);
-}
-
-int select_conv_rows_per_chunk(int rows, int kdim, int ncol) {
-  if (rows <= 0) return 1;
-  const size_t row_bytes = static_cast<size_t>(kdim + ncol) * sizeof(float);
-  if (row_bytes == 0) return rows;
-
-  int chunk_rows = static_cast<int>(kConvScratchTargetBytes / row_bytes);
-  chunk_rows = std::max(1, chunk_rows);
-  if (row_bytes <= kConvScratchTargetBytes) {
-    chunk_rows = std::max(kConvMinRowsPerChunk, chunk_rows);
-  }
-  chunk_rows = std::min(chunk_rows, rows);
-  return std::max(1, chunk_rows);
-}
 
 __device__ __forceinline__ float warp_reduce_sum(float v) {
   for (int offset = kGradSplitKWarpSize / 2; offset > 0; offset >>= 1) {
@@ -1676,17 +1633,25 @@ void gather_output_block_nhwc(const float* d_src, float* d_dst,
 }
 
 void launch_grad_gemm_tiled_group_nhwc(const float* d_x, const float* d_dy, float* d_dw,
-                                       int n, int h, int w, int c,
-                                       int base_ho, int base_wo,
-                                       int r, int s, int k,
-                                       const Conv2DParams& p,
-                                       int cin_base, int cin_group,
-                                       int kout_base, int kout_group,
-                                       bool can_vec4) {
-  const int m = n * base_ho * base_wo;
-  const int kdim = r * s * cin_group;
-  const int ncol = kout_group * p.ay * p.ax;
-  const int rows_per_chunk = select_grad_gemm_rows_per_chunk(m, kdim, ncol);
+                                       const Conv2DRuntimeConfig& cfg,
+                                       int cin_base, int kout_base) {
+  const int n = cfg.n;
+  const int h = cfg.h;
+  const int w = cfg.w;
+  const int c = cfg.c;
+  const int base_ho = cfg.shape.base_ho;
+  const int base_wo = cfg.shape.base_wo;
+  const int r = cfg.r;
+  const int s = cfg.s;
+  const int k = cfg.k;
+  const Conv2DParams& p = cfg.params;
+  const int cin_group = cfg.shape.cin_group;
+  const int kout_group = cfg.shape.kout_group;
+  const int kdim = cfg.kdim;
+  const int ncol = cfg.ncol;
+  const int m = cfg.m;
+  const int rows_per_chunk = cfg.grad_gemm_rows_per_chunk;
+  const bool can_vec4 = cfg.can_vec4;
 
   Workspace& ws = workspace();
   ensure_capacity(&ws.d_col, &ws.d_col_cap, static_cast<size_t>(rows_per_chunk) * kdim);
@@ -1748,20 +1713,31 @@ void launch_grad_gemm_tiled_group_nhwc(const float* d_x, const float* d_dy, floa
 }
 
 void launch_block_grad_gemm_tiled_group_nhwc(const float* d_x, const float* d_dy, float* d_dw,
-                                             int n, int h, int w, int c,
-                                             int base_ho, int base_wo,
-                                             int ho_start_base, int wo_start_base,
-                                             int block_ho_base, int block_wo_base,
-                                             int by_count, int bx_count,
-                                             int r, int s, int k,
-                                             const Conv2DParams& p,
-                                             int cin_base, int cin_group,
-                                             int kout_base, int kout_group,
+                                             const BlockConv2DRuntimeConfig& cfg,
+                                             int cin_base, int kout_base,
                                              int by, int bx) {
-  const int m = n * block_ho_base * block_wo_base;
-  const int kdim = r * s * cin_group;
-  const int ncol = kout_group * p.ay * p.ax;
-  const int rows_per_chunk = select_grad_gemm_rows_per_chunk(m, kdim, ncol);
+  const int n = cfg.n;
+  const int h = cfg.h;
+  const int w = cfg.w;
+  const int c = cfg.c;
+  const int base_ho = cfg.shape.base.base_ho;
+  const int base_wo = cfg.shape.base.base_wo;
+  const int ho_start_base = by * cfg.shape.block_ho;
+  const int wo_start_base = bx * cfg.shape.block_wo;
+  const int block_ho_base = cfg.shape.block_ho;
+  const int block_wo_base = cfg.shape.block_wo;
+  const int by_count = cfg.params.block_by;
+  const int bx_count = cfg.params.block_bx;
+  const int r = cfg.r;
+  const int s = cfg.s;
+  const int k = cfg.k;
+  const Conv2DParams& p = cfg.params.conv;
+  const int cin_group = cfg.shape.base.cin_group;
+  const int kout_group = cfg.shape.base.kout_group;
+  const int kdim = cfg.kdim;
+  const int ncol = cfg.ncol;
+  const int m = cfg.m_block;
+  const int rows_per_chunk = cfg.grad_gemm_rows_per_chunk;
 
   Workspace& ws = workspace();
   ensure_capacity(&ws.d_col, &ws.d_col_cap, static_cast<size_t>(rows_per_chunk) * kdim);
@@ -1870,15 +1846,26 @@ void scatter_block_filter_from_krsc(const float* d_src, float* d_dst,
 void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
                        int n, int h, int w, int c, int r, int s, int k,
                        const Conv2DParams& p) {
-  TensorNHWC x_shape(n, h, w, c);
-  FilterKRSC w_shape(r, s, c / p.groups, k, p.ay, p.ax);
-  ConvShape sh = infer_conv_shape(x_shape, w_shape, p);
+  const FilterKRSC w_shape(r, s, c / p.groups, k, p.ay, p.ax);
+  launch_fprop_nhwc(d_x, d_w, d_y, make_conv2d_runtime_config(n, h, w, c, w_shape, p));
+}
 
-  const int m = n * sh.base_ho * sh.base_wo;
-  const int kdim = r * s * sh.cin_group;
-  const int ncol = sh.kout_group * p.ay * p.ax;
-  const int rows_per_chunk = select_conv_rows_per_chunk(m, kdim, ncol);
-  const bool can_vec4 = (sh.cin_group % 4 == 0) && (sh.cin_group >= 4) && ((c % 4) == 0);
+void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
+                       const Conv2DRuntimeConfig& cfg) {
+  const int n = cfg.n;
+  const int h = cfg.h;
+  const int w = cfg.w;
+  const int c = cfg.c;
+  const int r = cfg.r;
+  const int s = cfg.s;
+  const int k = cfg.k;
+  const Conv2DParams& p = cfg.params;
+  const ConvShape& sh = cfg.shape;
+  const int m = cfg.m;
+  const int kdim = cfg.kdim;
+  const int ncol = cfg.ncol;
+  const int rows_per_chunk = cfg.conv_rows_per_chunk;
+  const bool can_vec4 = cfg.can_vec4;
 
   Workspace& ws = workspace();
   ensure_capacity(&ws.d_col, &ws.d_col_cap, static_cast<size_t>(rows_per_chunk) * kdim);
@@ -1937,14 +1924,25 @@ void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
 void launch_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
                        int n, int h, int w, int c, int r, int s, int k,
                        const Conv2DParams& p) {
-  TensorNHWC x_shape(n, h, w, c);
-  FilterKRSC w_shape(r, s, c / p.groups, k, p.ay, p.ax);
-  ConvShape sh = infer_conv_shape(x_shape, w_shape, p);
+  const FilterKRSC w_shape(r, s, c / p.groups, k, p.ay, p.ax);
+  launch_bprop_nhwc(d_dy, d_w, d_dx, make_conv2d_runtime_config(n, h, w, c, w_shape, p));
+}
 
-  const int m = n * sh.base_ho * sh.base_wo;
-  const int kdim = r * s * sh.cin_group;
-  const int ncol = sh.kout_group * p.ay * p.ax;
-  const int rows_per_chunk = select_conv_rows_per_chunk(m, kdim, ncol);
+void launch_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
+                       const Conv2DRuntimeConfig& cfg) {
+  const int n = cfg.n;
+  const int h = cfg.h;
+  const int w = cfg.w;
+  const int c = cfg.c;
+  const int r = cfg.r;
+  const int s = cfg.s;
+  const int k = cfg.k;
+  const Conv2DParams& p = cfg.params;
+  const ConvShape& sh = cfg.shape;
+  const int m = cfg.m;
+  const int kdim = cfg.kdim;
+  const int ncol = cfg.ncol;
+  const int rows_per_chunk = cfg.conv_rows_per_chunk;
 
   Workspace& ws = workspace();
   ensure_capacity(&ws.d_dy_mat, &ws.d_dy_mat_cap, static_cast<size_t>(rows_per_chunk) * ncol);
@@ -1996,17 +1994,30 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                       int n, int h, int w, int c, int r, int s, int k,
                       const Conv2DParams& p,
                       GradKernelAlgo algo) {
-  TensorNHWC x_shape(n, h, w, c);
-  FilterKRSC w_shape(r, s, c / p.groups, k, p.ay, p.ax);
-  ConvShape sh = infer_conv_shape(x_shape, w_shape, p);
+  const FilterKRSC w_shape(r, s, c / p.groups, k, p.ay, p.ax);
+  launch_grad_nhwc(d_x, d_dy, d_dw, make_conv2d_runtime_config(n, h, w, c, w_shape, p), algo);
+}
+
+void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
+                      const Conv2DRuntimeConfig& cfg,
+                      GradKernelAlgo algo) {
+  const int n = cfg.n;
+  const int h = cfg.h;
+  const int w = cfg.w;
+  const int c = cfg.c;
+  const int r = cfg.r;
+  const int s = cfg.s;
+  const int k = cfg.k;
+  const Conv2DParams& p = cfg.params;
+  const ConvShape& sh = cfg.shape;
 
   if ((p.ay != 1 || p.ax != 1) && algo != GradKernelAlgo::GemmIm2Col) {
     throw std::runtime_error("Ay/Ax currently support only grad_algo=gemm");
   }
 
   if (algo == GradKernelAlgo::Algo0Atomic) {
-    CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(r) * s * sh.cin_group * k * p.ay * p.ax * sizeof(float)));
-    const size_t total = static_cast<size_t>(n) * sh.ho * sh.wo * k;
+    CUDA_CHECK(cudaMemset(d_dw, 0, cfg.weight_elements * sizeof(float)));
+    const size_t total = cfg.output_elements;
     const int t = 256;
     const int blocks = static_cast<int>(std::min<size_t>((total + t - 1) / t, 65535));
     grad_filter_algo0_nhwc_kernel<<<blocks, t>>>(d_x, d_dy, d_dw,
@@ -2022,12 +2033,10 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
   }
 
   if (algo == GradKernelAlgo::Algo1Deterministic) {
-    const int m = n * sh.base_ho * sh.base_wo;
-    const int slice_weights = r * s * sh.cin_group * sh.kout_group * p.ay * p.ax;
-    const int packed_weights = r * s * sh.cin_group *
-                               ((sh.kout_group + kGradSplitKOutputsPerWarp - 1) / kGradSplitKOutputsPerWarp);
-    const int split_k = select_grad_split_k(m, static_cast<size_t>(slice_weights));
-    const int rows_per_chunk = (m + split_k - 1) / split_k;
+    const int slice_weights = cfg.grad_slice_weights;
+    const int packed_weights = cfg.grad_packed_weights;
+    const int split_k = cfg.grad_split_k;
+    const int rows_per_chunk = cfg.grad_deterministic_rows_per_chunk;
 
     Workspace& ws = workspace();
     ensure_capacity(&ws.d_grad_partials, &ws.d_grad_partials_cap, static_cast<size_t>(split_k) * slice_weights);
@@ -2035,7 +2044,7 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
 
     const dim3 block(kGradSplitKBlockSize);
     const dim3 grid((packed_weights + kGradSplitKWarpsPerBlock - 1) / kGradSplitKWarpsPerBlock, split_k);
-    const int reduce_blocks = (slice_weights + 255) / 256;
+    const int reduce_blocks = cfg.grad_reduce_blocks;
 
     for (int g = 0; g < p.groups; ++g) {
       const int cin_base = g * sh.cin_group;
@@ -2059,9 +2068,9 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
   }
 
   if (algo == GradKernelAlgo::Algo2TiledAtomic) {
-    CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(r) * s * sh.cin_group * k * p.ay * p.ax * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_dw, 0, cfg.weight_elements * sizeof(float)));
 
-    const int kdim = r * s * sh.cin_group;
+    const int kdim = cfg.kdim;
     const dim3 block(kGradTileKOut, kGradTileKDim);
     const dim3 grid((sh.kout_group + kGradTileKOut - 1) / kGradTileKOut,
                     (kdim + kGradTileKDim - 1) / kGradTileKDim,
@@ -2085,21 +2094,12 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
     return;
   }
 
-  const bool can_vec4 = (sh.cin_group % 4 == 0) && (sh.cin_group >= 4) && (c % 4 == 0);
-
-  CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(r) * s * sh.cin_group * k * p.ay * p.ax * sizeof(float)));
+  CUDA_CHECK(cudaMemset(d_dw, 0, cfg.weight_elements * sizeof(float)));
 
   for (int g = 0; g < p.groups; ++g) {
     const int cin_base = g * sh.cin_group;
     const int kout_base = g * sh.kout_group;
-    launch_grad_gemm_tiled_group_nhwc(d_x, d_dy, d_dw,
-                                      n, h, w, c,
-                                      sh.base_ho, sh.base_wo,
-                                      r, s, k,
-                                      p,
-                                      cin_base, sh.cin_group,
-                                      kout_base, sh.kout_group,
-                                      can_vec4);
+    launch_grad_gemm_tiled_group_nhwc(d_x, d_dy, d_dw, cfg, cin_base, kout_base);
   }
 
   CUDA_CHECK(cudaGetLastError());
@@ -2108,15 +2108,26 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
 void launch_block_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
                              int n, int h, int w, int c, int r, int s, int k,
                              const BlockConv2DParams& p) {
-  TensorNHWC x_shape(n, h, w, c);
-  BlockFilterKByBxRSC w_shape(k, p.block_by, p.block_bx, r, s, c / p.conv.groups, p.conv.ay, p.conv.ax);
-  const BlockConvShape sh = infer_block_conv_shape(x_shape, w_shape, p);
+  const BlockFilterKByBxRSC w_shape(k, p.block_by, p.block_bx, r, s, c / p.conv.groups, p.conv.ay, p.conv.ax);
+  launch_block_fprop_nhwc(d_x, d_w, d_y, make_block_conv2d_runtime_config(n, h, w, c, w_shape, p));
+}
 
-  const int m_block = n * sh.block_ho * sh.block_wo;
-  const int kdim = r * s * sh.base.cin_group;
-  const int ncol = sh.base.kout_group * p.conv.ay * p.conv.ax;
-  const int rows_per_chunk = select_conv_rows_per_chunk(m_block, kdim, ncol);
-  const size_t per_group_slice = static_cast<size_t>(kdim) * ncol;
+void launch_block_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
+                             const BlockConv2DRuntimeConfig& cfg) {
+  const int n = cfg.n;
+  const int h = cfg.h;
+  const int w = cfg.w;
+  const int c = cfg.c;
+  const int r = cfg.r;
+  const int s = cfg.s;
+  const int k = cfg.k;
+  const BlockConv2DParams& p = cfg.params;
+  const BlockConvShape& sh = cfg.shape;
+  const int m_block = cfg.m_block;
+  const int kdim = cfg.kdim;
+  const int ncol = cfg.ncol;
+  const int rows_per_chunk = cfg.conv_rows_per_chunk;
+  const size_t per_group_slice = cfg.per_group_slice;
 
   Workspace& ws = workspace();
   ensure_capacity(&ws.d_col, &ws.d_col_cap, static_cast<size_t>(rows_per_chunk) * kdim);
@@ -2172,15 +2183,26 @@ void launch_block_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
 void launch_block_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
                              int n, int h, int w, int c, int r, int s, int k,
                              const BlockConv2DParams& p) {
-  TensorNHWC x_shape(n, h, w, c);
-  BlockFilterKByBxRSC w_shape(k, p.block_by, p.block_bx, r, s, c / p.conv.groups, p.conv.ay, p.conv.ax);
-  const BlockConvShape sh = infer_block_conv_shape(x_shape, w_shape, p);
+  const BlockFilterKByBxRSC w_shape(k, p.block_by, p.block_bx, r, s, c / p.conv.groups, p.conv.ay, p.conv.ax);
+  launch_block_bprop_nhwc(d_dy, d_w, d_dx, make_block_conv2d_runtime_config(n, h, w, c, w_shape, p));
+}
 
-  const int m_block = n * sh.block_ho * sh.block_wo;
-  const int kdim = r * s * sh.base.cin_group;
-  const int ncol = sh.base.kout_group * p.conv.ay * p.conv.ax;
-  const int rows_per_chunk = select_conv_rows_per_chunk(m_block, kdim, ncol);
-  const size_t per_group_slice = static_cast<size_t>(kdim) * ncol;
+void launch_block_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
+                             const BlockConv2DRuntimeConfig& cfg) {
+  const int n = cfg.n;
+  const int h = cfg.h;
+  const int w = cfg.w;
+  const int c = cfg.c;
+  const int r = cfg.r;
+  const int s = cfg.s;
+  const int k = cfg.k;
+  const BlockConv2DParams& p = cfg.params;
+  const BlockConvShape& sh = cfg.shape;
+  const int m_block = cfg.m_block;
+  const int kdim = cfg.kdim;
+  const int ncol = cfg.ncol;
+  const int rows_per_chunk = cfg.conv_rows_per_chunk;
+  const size_t per_group_slice = cfg.per_group_slice;
 
   Workspace& ws = workspace();
   ensure_capacity(&ws.d_dy_mat, &ws.d_dy_mat_cap, static_cast<size_t>(rows_per_chunk) * ncol);
@@ -2239,17 +2261,30 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                             int n, int h, int w, int c, int r, int s, int k,
                             const BlockConv2DParams& p,
                             GradKernelAlgo algo) {
-  TensorNHWC x_shape(n, h, w, c);
-  BlockFilterKByBxRSC w_shape(k, p.block_by, p.block_bx, r, s, c / p.conv.groups, p.conv.ay, p.conv.ax);
-  const BlockConvShape sh = infer_block_conv_shape(x_shape, w_shape, p);
+  const BlockFilterKByBxRSC w_shape(k, p.block_by, p.block_bx, r, s, c / p.conv.groups, p.conv.ay, p.conv.ax);
+  launch_block_grad_nhwc(d_x, d_dy, d_dw, make_block_conv2d_runtime_config(n, h, w, c, w_shape, p), algo);
+}
+
+void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
+                            const BlockConv2DRuntimeConfig& cfg,
+                            GradKernelAlgo algo) {
+  const int n = cfg.n;
+  const int h = cfg.h;
+  const int w = cfg.w;
+  const int c = cfg.c;
+  const int r = cfg.r;
+  const int s = cfg.s;
+  const int k = cfg.k;
+  const BlockConv2DParams& p = cfg.params;
+  const BlockConvShape& sh = cfg.shape;
 
   if ((p.conv.ay != 1 || p.conv.ax != 1) && algo != GradKernelAlgo::GemmIm2Col) {
     throw std::runtime_error("Ay/Ax currently support only grad_algo=gemm");
   }
 
   if (algo == GradKernelAlgo::Algo0Atomic) {
-    CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(k) * p.block_by * p.block_bx * r * s * sh.base.cin_group * p.conv.ay * p.conv.ax * sizeof(float)));
-    const size_t total = static_cast<size_t>(n) * sh.base.ho * sh.base.wo * k;
+    CUDA_CHECK(cudaMemset(d_dw, 0, cfg.weight_elements * sizeof(float)));
+    const size_t total = cfg.output_elements;
     const int t = 256;
     const int blocks = static_cast<int>(std::min<size_t>((total + t - 1) / t, 65535));
     block_grad_filter_algo0_nhwc_kernel<<<blocks, t>>>(d_x, d_dy, d_dw,
@@ -2267,12 +2302,10 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
   }
 
   if (algo == GradKernelAlgo::Algo1Deterministic) {
-    const int m_block = n * sh.block_ho * sh.block_wo;
-    const int slice_weights = r * s * sh.base.cin_group * sh.base.kout_group * p.conv.ay * p.conv.ax;
-    const int packed_weights = r * s * sh.base.cin_group *
-                               ((sh.base.kout_group + kGradSplitKOutputsPerWarp - 1) / kGradSplitKOutputsPerWarp);
-    const int split_k = select_grad_split_k(m_block, static_cast<size_t>(slice_weights));
-    const int rows_per_chunk = (m_block + split_k - 1) / split_k;
+    const int slice_weights = cfg.grad_slice_weights;
+    const int packed_weights = cfg.grad_packed_weights;
+    const int split_k = cfg.grad_split_k;
+    const int rows_per_chunk = cfg.grad_deterministic_rows_per_chunk;
 
     Workspace& ws = workspace();
     ensure_capacity(&ws.d_grad_partials, &ws.d_grad_partials_cap, static_cast<size_t>(split_k) * slice_weights);
@@ -2280,7 +2313,7 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
 
     const dim3 block(kGradSplitKBlockSize);
     const dim3 grid((packed_weights + kGradSplitKWarpsPerBlock - 1) / kGradSplitKWarpsPerBlock, split_k);
-    const int reduce_blocks = (slice_weights + 255) / 256;
+    const int reduce_blocks = cfg.grad_reduce_blocks;
 
     for (int g = 0; g < p.conv.groups; ++g) {
       const int cin_base = g * sh.base.cin_group;
@@ -2316,9 +2349,9 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
   }
 
   if (algo == GradKernelAlgo::Algo2TiledAtomic) {
-    CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(k) * p.block_by * p.block_bx * r * s * sh.base.cin_group * p.conv.ay * p.conv.ax * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_dw, 0, cfg.weight_elements * sizeof(float)));
 
-    const int kdim = r * s * sh.base.cin_group;
+    const int kdim = cfg.kdim;
     const dim3 block(kGradTileKOut, kGradTileKDim);
     const dim3 grid((sh.base.kout_group + kGradTileKOut - 1) / kGradTileKOut,
                     (kdim + kGradTileKDim - 1) / kGradTileKDim,
@@ -2351,25 +2384,13 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
     return;
   }
 
-  CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(k) * p.block_by * p.block_bx * r * s * sh.base.cin_group * p.conv.ay * p.conv.ax * sizeof(float)));
+  CUDA_CHECK(cudaMemset(d_dw, 0, cfg.weight_elements * sizeof(float)));
   for (int g = 0; g < p.conv.groups; ++g) {
     const int cin_base = g * sh.base.cin_group;
     const int kout_base = g * sh.base.kout_group;
     for (int by = 0; by < p.block_by; ++by) {
-      const int ho_start = by * sh.block_ho;
       for (int bx = 0; bx < p.block_bx; ++bx) {
-        const int wo_start = bx * sh.block_wo;
-        launch_block_grad_gemm_tiled_group_nhwc(d_x, d_dy, d_dw,
-                                                n, h, w, c,
-                                                sh.base.base_ho, sh.base.base_wo,
-                                                ho_start, wo_start,
-                                                sh.block_ho, sh.block_wo,
-                                                p.block_by, p.block_bx,
-                                                r, s, k,
-                                                p.conv,
-                                                cin_base, sh.base.cin_group,
-                                                kout_base, sh.base.kout_group,
-                                                by, bx);
+        launch_block_grad_gemm_tiled_group_nhwc(d_x, d_dy, d_dw, cfg, cin_base, kout_base, by, bx);
       }
     }
   }

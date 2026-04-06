@@ -39,6 +39,8 @@ class Conv2DLayer {
 
   const float* device_weights() const { return d_w_; }
   const float* device_grad() const { return d_dw_; }
+  const Conv2DRuntimeConfig* regular_config() const { return blocked_ ? nullptr : &conv_config_; }
+  const BlockConv2DRuntimeConfig* blocked_config() const { return blocked_ ? &block_config_ : nullptr; }
 
   void copy_weights_from(const FilterKRSC& weights);
   void copy_weights_from(const BlockFilterKByBxRSC& weights);
@@ -66,6 +68,8 @@ class Conv2DLayer {
   bool blocked_ = false;
   Conv2DParams conv_params_;
   BlockConv2DParams block_params_;
+  Conv2DRuntimeConfig conv_config_;
+  BlockConv2DRuntimeConfig block_config_;
   GradKernelAlgo grad_algo_ = GradKernelAlgo::GemmIm2Col;
   int n_ = 0;
   int h_ = 0;

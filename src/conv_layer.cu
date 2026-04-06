@@ -31,12 +31,11 @@ Conv2DLayer::Conv2DLayer(int n, int h, int w, int c,
       k_(weights.k),
       cin_per_group_(weights.cin_per_group),
       ay_(weights.ay),
-      ax_(weights.ax),
-      weight_elements_(weights.elements()) {
-  TensorNHWC x_shape(n_, h_, w_, c_);
-  const ConvShape sh = infer_conv_shape(x_shape, weights, conv_params_);
-  out_h_ = sh.ho;
-  out_w_ = sh.wo;
+      ax_(weights.ax) {
+  conv_config_ = make_conv2d_runtime_config(n_, h_, w_, c_, weights, conv_params_);
+  out_h_ = conv_config_.shape.ho;
+  out_w_ = conv_config_.shape.wo;
+  weight_elements_ = conv_config_.weight_elements;
   allocate_buffers();
   copy_weights_from(weights);
 }
@@ -59,12 +58,11 @@ Conv2DLayer::Conv2DLayer(int n, int h, int w, int c,
       block_by_(weights.by),
       block_bx_(weights.bx),
       ay_(weights.ay),
-      ax_(weights.ax),
-      weight_elements_(weights.elements()) {
-  TensorNHWC x_shape(n_, h_, w_, c_);
-  const BlockConvShape sh = infer_block_conv_shape(x_shape, weights, block_params_);
-  out_h_ = sh.base.ho;
-  out_w_ = sh.base.wo;
+      ax_(weights.ax) {
+  block_config_ = make_block_conv2d_runtime_config(n_, h_, w_, c_, weights, block_params_);
+  out_h_ = block_config_.shape.base.ho;
+  out_w_ = block_config_.shape.base.wo;
+  weight_elements_ = block_config_.weight_elements;
   allocate_buffers();
   copy_weights_from(weights);
 }
@@ -75,11 +73,11 @@ Conv2DLayer::~Conv2DLayer() {
 }
 
 size_t Conv2DLayer::input_elements() const {
-  return static_cast<size_t>(n_) * h_ * w_ * c_;
+  return blocked_ ? block_config_.input_elements : conv_config_.input_elements;
 }
 
 size_t Conv2DLayer::output_elements() const {
-  return static_cast<size_t>(n_) * out_h_ * out_w_ * k_;
+  return blocked_ ? block_config_.output_elements : conv_config_.output_elements;
 }
 
 void Conv2DLayer::copy_weights_from(const FilterKRSC& weights) {
@@ -134,9 +132,9 @@ void Conv2DLayer::forward(const float* d_x, float* d_y) const {
   require_non_null(d_x, "d_x");
   require_non_null(d_y, "d_y");
   if (blocked_) {
-    launch_block_fprop_nhwc(d_x, d_w_, d_y, n_, h_, w_, c_, r_, s_, k_, block_params_);
+    launch_block_fprop_nhwc(d_x, d_w_, d_y, block_config_);
   } else {
-    launch_fprop_nhwc(d_x, d_w_, d_y, n_, h_, w_, c_, r_, s_, k_, conv_params_);
+    launch_fprop_nhwc(d_x, d_w_, d_y, conv_config_);
   }
 }
 
@@ -144,9 +142,9 @@ void Conv2DLayer::backward_input(const float* d_dy, float* d_dx) const {
   require_non_null(d_dy, "d_dy");
   require_non_null(d_dx, "d_dx");
   if (blocked_) {
-    launch_block_bprop_nhwc(d_dy, d_w_, d_dx, n_, h_, w_, c_, r_, s_, k_, block_params_);
+    launch_block_bprop_nhwc(d_dy, d_w_, d_dx, block_config_);
   } else {
-    launch_bprop_nhwc(d_dy, d_w_, d_dx, n_, h_, w_, c_, r_, s_, k_, conv_params_);
+    launch_bprop_nhwc(d_dy, d_w_, d_dx, conv_config_);
   }
 }
 
@@ -154,9 +152,9 @@ void Conv2DLayer::backward_filter(const float* d_x, const float* d_dy) {
   require_non_null(d_x, "d_x");
   require_non_null(d_dy, "d_dy");
   if (blocked_) {
-    launch_block_grad_nhwc(d_x, d_dy, d_dw_, n_, h_, w_, c_, r_, s_, k_, block_params_, grad_algo_);
+    launch_block_grad_nhwc(d_x, d_dy, d_dw_, block_config_, grad_algo_);
   } else {
-    launch_grad_nhwc(d_x, d_dy, d_dw_, n_, h_, w_, c_, r_, s_, k_, conv_params_, grad_algo_);
+    launch_grad_nhwc(d_x, d_dy, d_dw_, conv_config_, grad_algo_);
   }
 }
 
