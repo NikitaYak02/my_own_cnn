@@ -56,6 +56,9 @@ struct QuantizationParameters<DataType::Real32> {
 template <DataType T>
 __host__ __device__ inline int getZeroPoint(const QuantizationParameters<T>& qp);
 
+template <DataType T>
+__host__ __device__ inline float getScale(const QuantizationParameters<T>& qp);
+
 template <>
 __host__ __device__ inline int getZeroPoint<DataType::LinQuantU8>(
     const QuantizationParameters<DataType::LinQuantU8>& qp) {
@@ -78,6 +81,30 @@ template <>
 __host__ __device__ inline int getZeroPoint<DataType::Real32>(
     const QuantizationParameters<DataType::Real32>& qp) {
   return static_cast<int>(qp.zero_point);
+}
+
+template <>
+__host__ __device__ inline float getScale<DataType::LinQuantU8>(
+    const QuantizationParameters<DataType::LinQuantU8>& qp) {
+  return static_cast<float>(qp.scale);
+}
+
+template <>
+__host__ __device__ inline float getScale<DataType::LinQuantS5>(
+    const QuantizationParameters<DataType::LinQuantS5>& qp) {
+  return static_cast<float>(qp.scale);
+}
+
+template <>
+__host__ __device__ inline float getScale<DataType::LinQuantI32>(
+    const QuantizationParameters<DataType::LinQuantI32>& qp) {
+  return static_cast<float>(qp.scale);
+}
+
+template <>
+__host__ __device__ inline float getScale<DataType::Real32>(
+    const QuantizationParameters<DataType::Real32>& qp) {
+  return static_cast<float>(qp.scale);
 }
 
 template <DataType T>

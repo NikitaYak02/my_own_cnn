@@ -73,7 +73,7 @@ constexpr int kGradTileKDim = 8;
 constexpr int kGradTileKOut = 8;
 constexpr size_t kGradGemmTileTargetBytes = 64ull * 1024ull * 1024ull;
 constexpr int kGradGemmMinRowsPerChunk = 2048;
-constexpr size_t kConvScratchTargetBytes = 64ull * 1024ull * 1024ull;
+constexpr size_t kConvScratchTargetBytes = 96ull * 1024ull * 1024ull;
 constexpr int kConvMinRowsPerChunk = 1024;
 
 int select_grad_split_k(int rows, size_t slice_weights) {
@@ -2509,6 +2509,17 @@ __global__ void pack_block_filter_kbybxrsc_group_qi32_kernel(const float* __rest
   wg[idx] = raw - nnalgebra::getZeroPoint(*f_qp);
 }
 
+template <nnalgebra::DataType Tin>
+__global__ void update_output_qparams_kernel(
+    const nnalgebra::QuantizationParameters<Tin>* in_qp,
+    const nnalgebra::QuantizationParameters<Tin>* f_qp,
+    nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp,
+    int n) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n || !out_qp) return;
+  out_qp[idx].scale = nnalgebra::getScale(in_qp[idx]) * nnalgebra::getScale(*f_qp);
+}
+
 __global__ void unpack_matrix_to_nhwc_group_i32_kernel(const int32_t* __restrict__ src,
                                                        int32_t* __restrict__ dst,
                                                        int n, int h, int w, int c,
@@ -2634,7 +2645,8 @@ void launch_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, int32_t* d_
                                  int n, int h, int w, int c, int r, int s, int k,
                                  const Conv2DParams& p,
                                  const nnalgebra::QuantizationParameters<Tin>* in_qp,
-                                 const nnalgebra::QuantizationParameters<Tin>* f_qp) {
+                                 const nnalgebra::QuantizationParameters<Tin>* f_qp,
+                                 nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp) {
   if (p.ay != 1 || p.ax != 1) {
     throw std::runtime_error("quantized NHWC fprop does not support ay/ax != 1");
   }
@@ -2687,6 +2699,11 @@ void launch_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, int32_t* d_
                                                              kout_base, sh.kout_group);
   }
 
+  if (out_qp) {
+    const int blocks_qp = (n + t - 1) / t;
+    update_output_qparams_kernel<Tin><<<blocks_qp, t>>>(in_qp, f_qp, out_qp, n);
+  }
+
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2695,7 +2712,8 @@ void launch_block_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, int32
                                        int n, int h, int w, int c, int r, int s, int k,
                                        const BlockConv2DParams& p,
                                        const nnalgebra::QuantizationParameters<Tin>* in_qp,
-                                       const nnalgebra::QuantizationParameters<Tin>* f_qp) {
+                                       const nnalgebra::QuantizationParameters<Tin>* f_qp,
+                                       nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp) {
   if (p.conv.ay != 1 || p.conv.ax != 1) {
     throw std::runtime_error("quantized blocked NHWC fprop does not support ay/ax != 1");
   }
@@ -2759,6 +2777,11 @@ void launch_block_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, int32
     }
   }
 
+  if (out_qp) {
+    const int blocks_qp = (n + t - 1) / t;
+    update_output_qparams_kernel<Tin><<<blocks_qp, t>>>(in_qp, f_qp, out_qp, n);
+  }
+
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2770,32 +2793,36 @@ void launch_fprop_nhwc_qi32_u8(const float* d_x, const float* d_w, int32_t* d_y,
                                int n, int h, int w, int c, int r, int s, int k,
                                const Conv2DParams& p,
                                const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* in_qp,
-                               const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* f_qp) {
-  launch_fprop_nhwc_qi32_impl(d_x, d_w, d_y, n, h, w, c, r, s, k, p, in_qp, f_qp);
+                               const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* f_qp,
+                               nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp) {
+  launch_fprop_nhwc_qi32_impl(d_x, d_w, d_y, n, h, w, c, r, s, k, p, in_qp, f_qp, out_qp);
 }
 
 void launch_fprop_nhwc_qi32_s5(const float* d_x, const float* d_w, int32_t* d_y,
                                int n, int h, int w, int c, int r, int s, int k,
                                const Conv2DParams& p,
                                const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* in_qp,
-                               const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* f_qp) {
-  launch_fprop_nhwc_qi32_impl(d_x, d_w, d_y, n, h, w, c, r, s, k, p, in_qp, f_qp);
+                               const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* f_qp,
+                               nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp) {
+  launch_fprop_nhwc_qi32_impl(d_x, d_w, d_y, n, h, w, c, r, s, k, p, in_qp, f_qp, out_qp);
 }
 
 void launch_block_fprop_nhwc_qi32_u8(const float* d_x, const float* d_w, int32_t* d_y,
                                      int n, int h, int w, int c, int r, int s, int k,
                                      const BlockConv2DParams& p,
                                      const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* in_qp,
-                                     const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* f_qp) {
-  launch_block_fprop_nhwc_qi32_impl(d_x, d_w, d_y, n, h, w, c, r, s, k, p, in_qp, f_qp);
+                                     const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* f_qp,
+                                     nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp) {
+  launch_block_fprop_nhwc_qi32_impl(d_x, d_w, d_y, n, h, w, c, r, s, k, p, in_qp, f_qp, out_qp);
 }
 
 void launch_block_fprop_nhwc_qi32_s5(const float* d_x, const float* d_w, int32_t* d_y,
                                      int n, int h, int w, int c, int r, int s, int k,
                                      const BlockConv2DParams& p,
                                      const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* in_qp,
-                                     const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* f_qp) {
-  launch_block_fprop_nhwc_qi32_impl(d_x, d_w, d_y, n, h, w, c, r, s, k, p, in_qp, f_qp);
+                                     const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* f_qp,
+                                     nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp) {
+  launch_block_fprop_nhwc_qi32_impl(d_x, d_w, d_y, n, h, w, c, r, s, k, p, in_qp, f_qp, out_qp);
 }
 
 }  // namespace conv_quant_detail

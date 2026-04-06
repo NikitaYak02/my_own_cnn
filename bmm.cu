@@ -184,6 +184,53 @@ static bool launch_cublas_transpose_a_path(
     return st == CUBLAS_STATUS_SUCCESS;
 }
 
+static bool launch_cublas_transpose_b_path(
+    const float* A, const float* B, float* C,
+    int batch, int M, int N, int K,
+    bool accumulate)
+{
+    CublasContext& ctx = get_cublas_context();
+    if (ctx.handle == nullptr) {
+        return false;
+    }
+
+    cublasMath_t prev_math_mode = CUBLAS_DEFAULT_MATH;
+    if (cublasGetMathMode(ctx.handle, &prev_math_mode) != CUBLAS_STATUS_SUCCESS) {
+        return false;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = accumulate ? 1.0f : 0.0f;
+    cublasSetMathMode(ctx.handle, CUBLAS_DEFAULT_MATH);
+
+    cublasStatus_t st = CUBLAS_STATUS_NOT_INITIALIZED;
+    if (batch == 1) {
+        st = cublasSgemm(
+            ctx.handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            B, K,
+            A, K,
+            &beta,
+            C, N);
+    } else {
+        st = cublasSgemmStridedBatched(
+            ctx.handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            B, K, static_cast<long long>(N) * K,
+            A, K, static_cast<long long>(M) * K,
+            &beta,
+            C, N, static_cast<long long>(M) * N,
+            batch);
+    }
+
+    cublasSetMathMode(ctx.handle, prev_math_mode);
+    return st == CUBLAS_STATUS_SUCCESS;
+}
+
 }  // namespace
 
 /* ================================================================== */
@@ -516,6 +563,15 @@ static void bmm_matmul_impl(
     if (transpose_a && !transpose_b &&
         K >= kCublasTransposeAPathMinK &&
         launch_cublas_transpose_a_path(A, B, C, batch, M, N, K, accumulate)) {
+        return;
+    }
+
+    // Forward convolution uses row-major A[M,K] @ B[N,K]^T and was previously
+    // bound by the custom transpose-B kernel. Route that shape through cuBLAS
+    // so small kernels (1x1/3x3) and larger receptive fields both use a
+    // vendor GEMM instead of the slower fallback.
+    if (!transpose_a && transpose_b &&
+        launch_cublas_transpose_b_path(A, B, C, batch, M, N, K, accumulate)) {
         return;
     }
 

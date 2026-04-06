@@ -43,16 +43,30 @@ inline int32_t centered_block_weight_value(const BlockFilterKByBxRSC& w,
 }
 
 template <nnalgebra::DataType Tin>
+void populate_output_qparams(int n,
+                             const nnalgebra::QuantizationParameters<Tin>* in_qp,
+                             const nnalgebra::QuantizationParameters<Tin>* f_qp,
+                             nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp) {
+  if (!out_qp) return;
+  const float f_scale = nnalgebra::getScale(*f_qp);
+  for (int i = 0; i < n; ++i) {
+    out_qp[i].scale = nnalgebra::getScale(in_qp[i]) * f_scale;
+  }
+}
+
+template <nnalgebra::DataType Tin>
 void cpu_fprop_nhwc_qi32_impl(const TensorNHWC& x, const FilterKRSC& w, const Conv2DParams& p,
                               TensorNHWCI32& y,
                               const nnalgebra::QuantizationParameters<Tin>* in_qp,
-                              const nnalgebra::QuantizationParameters<Tin>* f_qp) {
+                              const nnalgebra::QuantizationParameters<Tin>* f_qp,
+                              nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp) {
   if (p.ay != 1 || p.ax != 1) {
     throw std::runtime_error("quantized CPU fprop does not support ay/ax != 1");
   }
   const ConvShape shape = infer_conv_shape(x, w, p);
   y = TensorNHWCI32(x.n, shape.ho, shape.wo, w.k);
   std::fill(y.data.begin(), y.data.end(), 0);
+  populate_output_qparams(x.n, in_qp, f_qp, out_qp);
 
   for (int n = 0; n < x.n; ++n) {
     for (int ho = 0; ho < shape.ho; ++ho) {
@@ -87,13 +101,15 @@ template <nnalgebra::DataType Tin>
 void cpu_block_fprop_nhwc_qi32_impl(const TensorNHWC& x, const BlockFilterKByBxRSC& w, const BlockConv2DParams& p,
                                     TensorNHWCI32& y,
                                     const nnalgebra::QuantizationParameters<Tin>* in_qp,
-                                    const nnalgebra::QuantizationParameters<Tin>* f_qp) {
+                                    const nnalgebra::QuantizationParameters<Tin>* f_qp,
+                                    nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp) {
   if (p.conv.ay != 1 || p.conv.ax != 1) {
     throw std::runtime_error("quantized CPU blocked fprop does not support ay/ax != 1");
   }
   const BlockConvShape shape = infer_block_conv_shape(x, w, p);
   y = TensorNHWCI32(x.n, shape.base.ho, shape.base.wo, w.k);
   std::fill(y.data.begin(), y.data.end(), 0);
+  populate_output_qparams(x.n, in_qp, f_qp, out_qp);
 
   for (int n = 0; n < x.n; ++n) {
     for (int ho = 0; ho < shape.base.ho; ++ho) {
@@ -411,29 +427,33 @@ namespace conv_quant_detail {
 void cpu_fprop_nhwc_qi32_u8(const TensorNHWC& x, const FilterKRSC& w, const Conv2DParams& p,
                             TensorNHWCI32& y,
                             const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* in_qp,
-                            const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* f_qp) {
-  cpu_fprop_nhwc_qi32_impl(x, w, p, y, in_qp, f_qp);
+                            const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* f_qp,
+                            nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp) {
+  cpu_fprop_nhwc_qi32_impl(x, w, p, y, in_qp, f_qp, out_qp);
 }
 
 void cpu_fprop_nhwc_qi32_s5(const TensorNHWC& x, const FilterKRSC& w, const Conv2DParams& p,
                             TensorNHWCI32& y,
                             const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* in_qp,
-                            const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* f_qp) {
-  cpu_fprop_nhwc_qi32_impl(x, w, p, y, in_qp, f_qp);
+                            const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* f_qp,
+                            nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp) {
+  cpu_fprop_nhwc_qi32_impl(x, w, p, y, in_qp, f_qp, out_qp);
 }
 
 void cpu_block_fprop_nhwc_qi32_u8(const TensorNHWC& x, const BlockFilterKByBxRSC& w, const BlockConv2DParams& p,
                                   TensorNHWCI32& y,
                                   const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* in_qp,
-                                  const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* f_qp) {
-  cpu_block_fprop_nhwc_qi32_impl(x, w, p, y, in_qp, f_qp);
+                                  const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* f_qp,
+                                  nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp) {
+  cpu_block_fprop_nhwc_qi32_impl(x, w, p, y, in_qp, f_qp, out_qp);
 }
 
 void cpu_block_fprop_nhwc_qi32_s5(const TensorNHWC& x, const BlockFilterKByBxRSC& w, const BlockConv2DParams& p,
                                   TensorNHWCI32& y,
                                   const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* in_qp,
-                                  const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* f_qp) {
-  cpu_block_fprop_nhwc_qi32_impl(x, w, p, y, in_qp, f_qp);
+                                  const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* f_qp,
+                                  nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp) {
+  cpu_block_fprop_nhwc_qi32_impl(x, w, p, y, in_qp, f_qp, out_qp);
 }
 
 }  // namespace conv_quant_detail
