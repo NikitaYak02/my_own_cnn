@@ -1,6 +1,8 @@
 #include "bmm.h"
 
 #include <cstdint>
+#include <cublasLt.h>
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <stdio.h>
 
@@ -19,6 +21,216 @@ constexpr int kSharedPad = 1;
 static_assert(kBlockRows % kThreadRows == 0, "row tile must divide block rows");
 static_assert(kBlockCols % kThreadCols == 0, "col tile must divide block cols");
 
+constexpr int kCublasTransposeAPathMinK = 512;
+constexpr size_t kCublasLtWorkspaceBytes = 64ull * 1024ull * 1024ull;
+
+struct CublasContext {
+    cublasHandle_t handle = nullptr;
+    cublasLtHandle_t lt_handle = nullptr;
+    void* lt_workspace = nullptr;
+    size_t lt_workspace_cap = 0;
+    bool init = false;
+
+    ~CublasContext() {
+        if (lt_workspace) cudaFree(lt_workspace);
+        if (lt_handle) cublasLtDestroy(lt_handle);
+        if (handle) cublasDestroy(handle);
+    }
+};
+
+static CublasContext& get_cublas_context() {
+    static CublasContext ctx;
+    if (!ctx.init) {
+        if (cublasCreate(&ctx.handle) != CUBLAS_STATUS_SUCCESS) {
+            return ctx;
+        }
+        cublasSetMathMode(ctx.handle, CUBLAS_TF32_TENSOR_OP_MATH);
+        if (cublasLtCreate(&ctx.lt_handle) != CUBLAS_STATUS_SUCCESS) {
+            ctx.lt_handle = nullptr;
+        }
+        ctx.init = true;
+    }
+    return ctx;
+}
+
+static bool ensure_cublaslt_workspace(CublasContext& ctx, size_t bytes) {
+    if (ctx.lt_workspace_cap >= bytes) return true;
+    if (ctx.lt_workspace) {
+        cudaFree(ctx.lt_workspace);
+        ctx.lt_workspace = nullptr;
+        ctx.lt_workspace_cap = 0;
+    }
+    if (cudaMalloc(&ctx.lt_workspace, bytes) != cudaSuccess) {
+        ctx.lt_workspace = nullptr;
+        ctx.lt_workspace_cap = 0;
+        return false;
+    }
+    ctx.lt_workspace_cap = bytes;
+    return true;
+}
+
+static bool launch_cublaslt_transpose_a_path(
+    const float* A, const float* B, float* C,
+    int batch, int M, int N, int K,
+    bool accumulate)
+{
+    CublasContext& ctx = get_cublas_context();
+    if (ctx.lt_handle == nullptr) {
+        return false;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = accumulate ? 1.0f : 0.0f;
+
+    cublasOperation_t transa = CUBLAS_OP_T;
+    cublasOperation_t transb = CUBLAS_OP_N;
+
+    cublasLtMatmulDesc_t op_desc = nullptr;
+    cublasLtMatrixLayout_t a_desc = nullptr;
+    cublasLtMatrixLayout_t b_desc = nullptr;
+    cublasLtMatrixLayout_t c_desc = nullptr;
+    cublasLtMatmulPreference_t pref = nullptr;
+    cublasLtOrder_t row_order = CUBLASLT_ORDER_ROW;
+    int64_t batch_count = batch;
+    int64_t stride_a = static_cast<int64_t>(K) * M;
+    int64_t stride_b = static_cast<int64_t>(K) * N;
+    int64_t stride_c = static_cast<int64_t>(M) * N;
+    size_t workspace_bytes = kCublasLtWorkspaceBytes;
+    int found = 0;
+    bool ok = false;
+
+    if (cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F_FAST_TF32, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS) goto cleanup;
+    if (cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)) != CUBLAS_STATUS_SUCCESS) goto cleanup;
+    if (cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)) != CUBLAS_STATUS_SUCCESS) goto cleanup;
+
+    if (cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_32F, K, M, M) != CUBLAS_STATUS_SUCCESS) goto cleanup;
+    if (cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_32F, K, N, N) != CUBLAS_STATUS_SUCCESS) goto cleanup;
+    if (cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_32F, M, N, N) != CUBLAS_STATUS_SUCCESS) goto cleanup;
+
+    if (cublasLtMatrixLayoutSetAttribute(a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)) != CUBLAS_STATUS_SUCCESS) goto cleanup;
+    if (cublasLtMatrixLayoutSetAttribute(b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)) != CUBLAS_STATUS_SUCCESS) goto cleanup;
+    if (cublasLtMatrixLayoutSetAttribute(c_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)) != CUBLAS_STATUS_SUCCESS) goto cleanup;
+
+    if (batch > 1) {
+        if (cublasLtMatrixLayoutSetAttribute(a_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)) != CUBLAS_STATUS_SUCCESS) goto cleanup;
+        if (cublasLtMatrixLayoutSetAttribute(b_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)) != CUBLAS_STATUS_SUCCESS) goto cleanup;
+        if (cublasLtMatrixLayoutSetAttribute(c_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)) != CUBLAS_STATUS_SUCCESS) goto cleanup;
+        if (cublasLtMatrixLayoutSetAttribute(a_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_a, sizeof(stride_a)) != CUBLAS_STATUS_SUCCESS) goto cleanup;
+        if (cublasLtMatrixLayoutSetAttribute(b_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_b, sizeof(stride_b)) != CUBLAS_STATUS_SUCCESS) goto cleanup;
+        if (cublasLtMatrixLayoutSetAttribute(c_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_c, sizeof(stride_c)) != CUBLAS_STATUS_SUCCESS) goto cleanup;
+    }
+
+    if (cublasLtMatmulPreferenceCreate(&pref) != CUBLAS_STATUS_SUCCESS) goto cleanup;
+    if (cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                             &workspace_bytes, sizeof(workspace_bytes)) != CUBLAS_STATUS_SUCCESS) goto cleanup;
+
+    if (!ensure_cublaslt_workspace(ctx, workspace_bytes)) goto cleanup;
+
+    cublasLtMatmulHeuristicResult_t heuristics[8];
+    if (cublasLtMatmulAlgoGetHeuristic(ctx.lt_handle, op_desc, a_desc, b_desc, c_desc, c_desc,
+                                       pref, 8, heuristics, &found) != CUBLAS_STATUS_SUCCESS) goto cleanup;
+    for (int i = 0; i < found; ++i) {
+        if (heuristics[i].state != CUBLAS_STATUS_SUCCESS) continue;
+        const cublasStatus_t st = cublasLtMatmul(ctx.lt_handle,
+                                                 op_desc,
+                                                 &alpha,
+                                                 A, a_desc,
+                                                 B, b_desc,
+                                                 &beta,
+                                                 C, c_desc,
+                                                 C, c_desc,
+                                                 &heuristics[i].algo,
+                                                 ctx.lt_workspace,
+                                                 ctx.lt_workspace_cap,
+                                                 nullptr);
+        if (st == CUBLAS_STATUS_SUCCESS) {
+            ok = true;
+            break;
+        }
+    }
+
+cleanup:
+    if (pref) cublasLtMatmulPreferenceDestroy(pref);
+    if (c_desc) cublasLtMatrixLayoutDestroy(c_desc);
+    if (b_desc) cublasLtMatrixLayoutDestroy(b_desc);
+    if (a_desc) cublasLtMatrixLayoutDestroy(a_desc);
+    if (op_desc) cublasLtMatmulDescDestroy(op_desc);
+    return ok;
+}
+
+static bool launch_cublas_transpose_a_path(
+    const float* A, const float* B, float* C,
+    int batch, int M, int N, int K,
+    bool accumulate)
+{
+    CublasContext& ctx = get_cublas_context();
+    if (ctx.handle == nullptr) {
+        return false;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = accumulate ? 1.0f : 0.0f;
+    const cublasStatus_t st = cublasSgemmStridedBatched(
+        ctx.handle,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        N, M, K,
+        &alpha,
+        B, N, static_cast<long long>(K) * N,
+        A, M, static_cast<long long>(K) * M,
+        &beta,
+        C, N, static_cast<long long>(M) * N,
+        batch);
+
+    return st == CUBLAS_STATUS_SUCCESS;
+}
+
+static bool launch_cublas_transpose_b_path(
+    const float* A, const float* B, float* C,
+    int batch, int M, int N, int K,
+    bool accumulate)
+{
+    CublasContext& ctx = get_cublas_context();
+    if (ctx.handle == nullptr) {
+        return false;
+    }
+
+    cublasMath_t prev_math_mode = CUBLAS_DEFAULT_MATH;
+    if (cublasGetMathMode(ctx.handle, &prev_math_mode) != CUBLAS_STATUS_SUCCESS) {
+        return false;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = accumulate ? 1.0f : 0.0f;
+    cublasSetMathMode(ctx.handle, CUBLAS_DEFAULT_MATH);
+
+    cublasStatus_t st = CUBLAS_STATUS_NOT_INITIALIZED;
+    if (batch == 1) {
+        st = cublasSgemm(
+            ctx.handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            B, K,
+            A, K,
+            &beta,
+            C, N);
+    } else {
+        st = cublasSgemmStridedBatched(
+            ctx.handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            B, K, static_cast<long long>(N) * K,
+            A, K, static_cast<long long>(M) * K,
+            &beta,
+            C, N, static_cast<long long>(M) * N,
+            batch);
+    }
+
+    cublasSetMathMode(ctx.handle, prev_math_mode);
+    return st == CUBLAS_STATUS_SUCCESS;
+}
+
 }  // namespace
 
 /* ================================================================== */
@@ -33,21 +245,33 @@ static_assert(kBlockCols % kThreadCols == 0, "col tile must divide block cols");
 /*  coalesced reads for the transposed operand as well.               */
 /* ------------------------------------------------------------------ */
 
-template <bool TRANS_A, bool TRANS_B>
+template <bool TRANS_A, bool TRANS_B, bool ACCUM>
 __global__ void bmm_tiled_kernel(
     const float* __restrict__ A,
     const float* __restrict__ B,
     float* __restrict__ C,
-    int M, int N, int K)
+    int batch, int M, int N, int K,
+    int tiles_m, int tiles_n,
+    size_t tile_block_offset)
 {
-    // blockIdx.z selects the current matrix pair within the batch.
-    const int batch_idx = blockIdx.z;
+    // Linearize output tiles so large M or batch values do not overflow
+    // gridDim.y / gridDim.z, which are capped at 65535.
+    const size_t linear_tile = tile_block_offset + static_cast<size_t>(blockIdx.x);
+    const size_t tile_row_batch = linear_tile / static_cast<size_t>(tiles_n);
+    const size_t batch_linear = tile_row_batch / static_cast<size_t>(tiles_m);
+    if (batch_linear >= static_cast<size_t>(batch)) {
+        return;
+    }
+
+    const int batch_idx = static_cast<int>(batch_linear);
+    const int tile_row_idx = static_cast<int>(tile_row_batch - batch_linear * static_cast<size_t>(tiles_m));
+    const int tile_col_idx = static_cast<int>(linear_tile - tile_row_batch * static_cast<size_t>(tiles_n));
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
     const int tid = ty * blockDim.x + tx;
 
-    const int tile_row = blockIdx.y * kBlockRows;
-    const int tile_col = blockIdx.x * kBlockCols;
+    const int tile_row = tile_row_idx * kBlockRows;
+    const int tile_col = tile_col_idx * kBlockCols;
     const int local_row = ty * kThreadRows;
     const int local_col = tx * kThreadCols;
     const int out_row0 = tile_row + local_row;
@@ -128,13 +352,17 @@ __global__ void bmm_tiled_kernel(
         for (int j = 0; j < kThreadCols; ++j) {
             const int out_col = out_col0 + j;
             if (out_col < N) {
-                Cn[out_row * N + out_col] = acc[i][j];
+                if constexpr (ACCUM) {
+                    Cn[out_row * N + out_col] += acc[i][j];
+                } else {
+                    Cn[out_row * N + out_col] = acc[i][j];
+                }
             }
         }
     }
 }
 
-template <bool TRANS_A, bool TRANS_B>
+template <bool TRANS_A, bool TRANS_B, bool ACCUM>
 static void launch_bmm_kernel(
     const float* A,
     const float* B,
@@ -144,12 +372,27 @@ static void launch_bmm_kernel(
     int N,
     int K)
 {
-    dim3 block(kBlockCols / kThreadCols, kBlockRows / kThreadRows);
-    dim3 grid((N + kBlockCols - 1) / kBlockCols,
-              (M + kBlockRows - 1) / kBlockRows,
-              batch);
+    if (batch <= 0 || M <= 0 || N <= 0 || K <= 0) {
+        return;
+    }
 
-    bmm_tiled_kernel<TRANS_A, TRANS_B><<<grid, block>>>(A, B, C, M, N, K);
+    dim3 block(kBlockCols / kThreadCols, kBlockRows / kThreadRows);
+    const int tiles_m = (M + kBlockRows - 1) / kBlockRows;
+    const int tiles_n = (N + kBlockCols - 1) / kBlockCols;
+    const size_t total_tiles = static_cast<size_t>(batch) * tiles_m * tiles_n;
+    constexpr unsigned int kMaxGridX = 0x7fffffffu;
+
+    for (size_t tile_offset = 0; tile_offset < total_tiles; ) {
+        const size_t remaining_tiles = total_tiles - tile_offset;
+        const unsigned int grid_x =
+            remaining_tiles > static_cast<size_t>(kMaxGridX)
+                ? kMaxGridX
+                : static_cast<unsigned int>(remaining_tiles);
+        dim3 grid(grid_x, 1, 1);
+        bmm_tiled_kernel<TRANS_A, TRANS_B, ACCUM><<<grid, block>>>(
+            A, B, C, batch, M, N, K, tiles_m, tiles_n, tile_offset);
+        tile_offset += grid_x;
+    }
 }
 
 template <bool TRANS_A, bool TRANS_B>
@@ -157,15 +400,26 @@ __global__ void bmm_tiled_i32_kernel(
     const int32_t* __restrict__ A,
     const int32_t* __restrict__ B,
     int32_t* __restrict__ C,
-    int M, int N, int K)
+    int batch, int M, int N, int K,
+    int tiles_m, int tiles_n,
+    size_t tile_block_offset)
 {
-    const int batch_idx = blockIdx.z;
+    const size_t linear_tile = tile_block_offset + static_cast<size_t>(blockIdx.x);
+    const size_t tile_row_batch = linear_tile / static_cast<size_t>(tiles_n);
+    const size_t batch_linear = tile_row_batch / static_cast<size_t>(tiles_m);
+    if (batch_linear >= static_cast<size_t>(batch)) {
+        return;
+    }
+
+    const int batch_idx = static_cast<int>(batch_linear);
+    const int tile_row_idx = static_cast<int>(tile_row_batch - batch_linear * static_cast<size_t>(tiles_m));
+    const int tile_col_idx = static_cast<int>(linear_tile - tile_row_batch * static_cast<size_t>(tiles_n));
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
     const int tid = ty * blockDim.x + tx;
 
-    const int tile_row = blockIdx.y * kBlockRows;
-    const int tile_col = blockIdx.x * kBlockCols;
+    const int tile_row = tile_row_idx * kBlockRows;
+    const int tile_col = tile_col_idx * kBlockCols;
     const int local_row = ty * kThreadRows;
     const int local_col = tx * kThreadCols;
     const int out_row0 = tile_row + local_row;
@@ -255,44 +509,108 @@ static void launch_bmm_i32_kernel(
     int N,
     int K)
 {
-    dim3 block(kBlockCols / kThreadCols, kBlockRows / kThreadRows);
-    dim3 grid((N + kBlockCols - 1) / kBlockCols,
-              (M + kBlockRows - 1) / kBlockRows,
-              batch);
+    if (batch <= 0 || M <= 0 || N <= 0 || K <= 0) {
+        return;
+    }
 
-    bmm_tiled_i32_kernel<TRANS_A, TRANS_B><<<grid, block>>>(A, B, C, M, N, K);
+    dim3 block(kBlockCols / kThreadCols, kBlockRows / kThreadRows);
+    const int tiles_m = (M + kBlockRows - 1) / kBlockRows;
+    const int tiles_n = (N + kBlockCols - 1) / kBlockCols;
+    const size_t total_tiles = static_cast<size_t>(batch) * tiles_m * tiles_n;
+    constexpr unsigned int kMaxGridX = 0x7fffffffu;
+
+    for (size_t tile_offset = 0; tile_offset < total_tiles; ) {
+        const size_t remaining_tiles = total_tiles - tile_offset;
+        const unsigned int grid_x =
+            remaining_tiles > static_cast<size_t>(kMaxGridX)
+                ? kMaxGridX
+                : static_cast<unsigned int>(remaining_tiles);
+        dim3 grid(grid_x, 1, 1);
+        bmm_tiled_i32_kernel<TRANS_A, TRANS_B><<<grid, block>>>(
+            A, B, C, batch, M, N, K, tiles_m, tiles_n, tile_offset);
+        tile_offset += grid_x;
+    }
 }
 
 /* ================================================================== */
 /*                          HOST  WRAPPERS                            */
 /* ================================================================== */
 
-extern "C" void bmm_matmul(
+static void bmm_matmul_impl(
     const float* A, const float* B, float* C,
     int batch, int M, int N, int K,
-    int trans_a, int trans_b)
+    int trans_a, int trans_b,
+    bool accumulate)
 {
+    if (batch <= 0 || M <= 0 || N <= 0 || K <= 0) {
+        return;
+    }
+
     // Dispatch once on transpose flags so the inner kernel can stay branch-free
     // with respect to data layout.
     const bool transpose_a = trans_a != 0;
     const bool transpose_b = trans_b != 0;
 
+    // Prefer cuBLASLt for transpose-A weight-gradient-like shapes. It handles
+    // small-output / large-reduction GEMMs much better on modern GPUs and may
+    // internally choose split-K style algorithms.
+    if (transpose_a && !transpose_b &&
+        K >= kCublasTransposeAPathMinK &&
+        launch_cublaslt_transpose_a_path(A, B, C, batch, M, N, K, accumulate)) {
+        return;
+    }
+
+    if (transpose_a && !transpose_b &&
+        K >= kCublasTransposeAPathMinK &&
+        launch_cublas_transpose_a_path(A, B, C, batch, M, N, K, accumulate)) {
+        return;
+    }
+
+    // Forward convolution uses row-major A[M,K] @ B[N,K]^T and was previously
+    // bound by the custom transpose-B kernel. Route that shape through cuBLAS
+    // so small kernels (1x1/3x3) and larger receptive fields both use a
+    // vendor GEMM instead of the slower fallback.
+    if (!transpose_a && transpose_b &&
+        launch_cublas_transpose_b_path(A, B, C, batch, M, N, K, accumulate)) {
+        return;
+    }
+
     if (!transpose_a && !transpose_b) {
-        launch_bmm_kernel<false, false>(A, B, C, batch, M, N, K);
+        if (accumulate) launch_bmm_kernel<false, false, true>(A, B, C, batch, M, N, K);
+        else launch_bmm_kernel<false, false, false>(A, B, C, batch, M, N, K);
         return;
     }
 
     if (!transpose_a && transpose_b) {
-        launch_bmm_kernel<false, true>(A, B, C, batch, M, N, K);
+        if (accumulate) launch_bmm_kernel<false, true, true>(A, B, C, batch, M, N, K);
+        else launch_bmm_kernel<false, true, false>(A, B, C, batch, M, N, K);
         return;
     }
 
     if (transpose_a && !transpose_b) {
-        launch_bmm_kernel<true, false>(A, B, C, batch, M, N, K);
+        if (accumulate) launch_bmm_kernel<true, false, true>(A, B, C, batch, M, N, K);
+        else launch_bmm_kernel<true, false, false>(A, B, C, batch, M, N, K);
         return;
     }
 
-    launch_bmm_kernel<true, true>(A, B, C, batch, M, N, K);
+    if (accumulate) launch_bmm_kernel<true, true, true>(A, B, C, batch, M, N, K);
+    else launch_bmm_kernel<true, true, false>(A, B, C, batch, M, N, K);
+}
+
+extern "C" void bmm_matmul(
+    const float* A, const float* B, float* C,
+    int batch, int M, int N, int K,
+    int trans_a, int trans_b)
+{
+    bmm_matmul_impl(A, B, C, batch, M, N, K, trans_a, trans_b, false);
+}
+
+extern "C" void bmm_matmul_accum(
+    const float* A, const float* B, float* C,
+    int batch, int M, int N, int K,
+    int trans_a, int trans_b)
+{
+    bmm_matmul_impl(A, B, C, batch, M, N, K, trans_a, trans_b, true);
 }
 
 extern "C" void bmm_matmul_i32(
@@ -300,6 +618,10 @@ extern "C" void bmm_matmul_i32(
     int batch, int M, int N, int K,
     int trans_a, int trans_b)
 {
+    if (batch <= 0 || M <= 0 || N <= 0 || K <= 0) {
+        return;
+    }
+
     const bool transpose_a = trans_a != 0;
     const bool transpose_b = trans_b != 0;
 

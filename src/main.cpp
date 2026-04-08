@@ -15,6 +15,7 @@ namespace {
 struct Options {
   std::string op = "all";
   std::string custom_mode = "explicit";
+  std::string grad_algo = "gemm";
   int n = 32;
   int h = 56;
   int w = 56;
@@ -29,6 +30,8 @@ struct Options {
   int dilation_h = 1;
   int dilation_w = 1;
   int groups = 1;
+  int ay = 1;
+  int ax = 1;
   int block_by = 1;
   int block_bx = 1;
   int warmup = 10;
@@ -55,6 +58,8 @@ struct BenchCase {
   int dilation_h;
   int dilation_w;
   int groups;
+  int ay;
+  int ax;
   int block_by;
   int block_bx;
 };
@@ -73,6 +78,33 @@ int parse_int(const std::string& v, const char* name) {
   }
 }
 
+GradKernelAlgo parse_grad_algo(const std::string& value) {
+  if (value == "gemm") return GradKernelAlgo::GemmIm2Col;
+  if (value == "algo0") return GradKernelAlgo::Algo0Atomic;
+  if (value == "algo1") return GradKernelAlgo::Algo1Deterministic;
+  if (value == "algo2" || value == "tile") return GradKernelAlgo::Algo2TiledAtomic;
+  throw std::runtime_error("invalid value for --grad_algo: " + value + " (expected gemm|algo0|algo1|algo2|tile|all)");
+}
+
+const char* grad_algo_to_string(GradKernelAlgo algo) {
+  switch (algo) {
+    case GradKernelAlgo::GemmIm2Col: return "gemm";
+    case GradKernelAlgo::Algo0Atomic: return "algo0";
+    case GradKernelAlgo::Algo1Deterministic: return "algo1";
+    case GradKernelAlgo::Algo2TiledAtomic: return "algo2";
+    default: return "unknown";
+  }
+}
+
+std::vector<std::string> expand_grad_algo_names(const std::string& value) {
+  if (value == "all") {
+    return {"gemm", "algo0", "algo1", "algo2"};
+  }
+  (void)parse_grad_algo(value);
+  if (value == "tile") return {"algo2"};
+  return {value};
+}
+
 Options parse_args(int argc, char** argv) {
   Options o;
   for (int i = 1; i < argc; ++i) {
@@ -84,6 +116,7 @@ Options parse_args(int argc, char** argv) {
 
     if (a == "--op") o.op = need_val("--op");
     else if (a == "--custom_mode") o.custom_mode = need_val("--custom_mode");
+    else if (a == "--grad_algo") o.grad_algo = need_val("--grad_algo");
     else if (a == "--n") o.n = parse_int(need_val("--n"), "--n");
     else if (a == "--h") o.h = parse_int(need_val("--h"), "--h");
     else if (a == "--w") o.w = parse_int(need_val("--w"), "--w");
@@ -98,6 +131,8 @@ Options parse_args(int argc, char** argv) {
     else if (a == "--dilation_h") o.dilation_h = parse_int(need_val("--dilation_h"), "--dilation_h");
     else if (a == "--dilation_w") o.dilation_w = parse_int(need_val("--dilation_w"), "--dilation_w");
     else if (a == "--groups") o.groups = parse_int(need_val("--groups"), "--groups");
+    else if (a == "--ay") o.ay = parse_int(need_val("--ay"), "--ay");
+    else if (a == "--ax") o.ax = parse_int(need_val("--ax"), "--ax");
     else if (a == "--block_by") o.block_by = parse_int(need_val("--block_by"), "--block_by");
     else if (a == "--block_bx") o.block_bx = parse_int(need_val("--block_bx"), "--block_bx");
     else if (a == "--warmup") o.warmup = parse_int(need_val("--warmup"), "--warmup");
@@ -111,8 +146,9 @@ Options parse_args(int argc, char** argv) {
           << "conv_bench options:\n"
           << "  --op fprop|bprop|grad|all\n"
           << "  --custom_mode explicit|blocked\n"
+          << "  --grad_algo gemm|algo0|algo1|algo2|tile|all\n"
           << "  --n --h --w --c --k --r --s\n"
-          << "  --pad_h --pad_w --stride_h --stride_w --dilation_h --dilation_w --groups\n"
+          << "  --pad_h --pad_w --stride_h --stride_w --dilation_h --dilation_w --groups --ay --ax\n"
           << "  --block_by --block_bx\n"
           << "  --warmup --iters --seed\n"
           << "  --check --with_cudnn --bench_suite\n";
@@ -160,28 +196,42 @@ float vec_max(std::vector<float> v) {
   return *std::max_element(v.begin(), v.end());
 }
 
+void push_ratio(std::vector<float>& out, float ratio) {
+  if (ratio > 0.0f) out.push_back(ratio);
+}
+
+void print_ratio_summary_line(const char* label, const std::vector<float>& ratios) {
+  if (ratios.empty()) return;
+  std::cout << label
+            << " min=" << std::fixed << std::setprecision(3) << vec_min(ratios)
+            << "x median=" << vec_median(ratios)
+            << "x max=" << vec_max(ratios) << "x\n";
+}
+
 std::vector<BenchCase> default_bench_suite() {
   return {
-      {"resnet_like_56x56", 32, 56, 56, 64, 64, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1},
-      {"resnet_like_28x28", 32, 28, 28, 128, 256, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1},
-      {"downsample_stride2", 32, 112, 112, 32, 32, 3, 3, 1, 1, 2, 2, 1, 1, 1, 1, 1},
-      {"depthwise_3x3", 32, 56, 56, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 128, 1, 1},
-      {"grouped_g4", 32, 56, 56, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 4, 1, 1},
-      {"pointwise_1x1", 32, 56, 56, 128, 256, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1},
-      {"dilated_3x3", 16, 64, 64, 64, 64, 3, 3, 2, 2, 1, 1, 2, 2, 1, 1, 1},
-      {"small_batch", 1, 56, 56, 64, 64, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+      {"resnet_like_56x56", 32, 56, 56, 64, 64, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+      {"resnet_like_28x28", 32, 28, 28, 128, 256, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+      {"downsample_stride2", 32, 112, 112, 32, 32, 3, 3, 1, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1},
+      {"depthwise_3x3", 32, 56, 56, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 128, 1, 1, 1, 1},
+      {"grouped_g4", 32, 56, 56, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 4, 1, 1, 1, 1},
+      {"pointwise_1x1", 32, 56, 56, 128, 256, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+      {"dilated_3x3", 16, 64, 64, 64, 64, 3, 3, 2, 2, 1, 1, 2, 2, 1, 1, 1, 1, 1},
+      {"small_batch", 1, 56, 56, 64, 64, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+      {"large_batch_128x128_n16_c64_k128", 16, 128, 128, 64, 128, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+      {"large_batch_128x128_n8_c128_k128", 8, 128, 128, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
   };
 }
 
 std::vector<BenchCase> default_blocked_bench_suite() {
   return {
-      {"blocked_resnet_56x56_b2x2", 32, 56, 56, 64, 64, 3, 3, 1, 1, 1, 1, 1, 1, 1, 2, 2},
-      {"blocked_resnet_56x56_b4x4", 32, 56, 56, 64, 64, 3, 3, 1, 1, 1, 1, 1, 1, 1, 4, 4},
-      {"blocked_resnet_28x28_b2x4", 32, 28, 28, 128, 256, 3, 3, 1, 1, 1, 1, 1, 1, 1, 2, 4},
-      {"blocked_grouped_g4_b2x2", 32, 56, 56, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 4, 2, 2},
-      {"blocked_pointwise_1x1_b4x4", 32, 56, 56, 128, 256, 1, 1, 0, 0, 1, 1, 1, 1, 1, 4, 4},
-      {"blocked_dilated_3x3_b2x2", 16, 64, 64, 64, 64, 3, 3, 2, 2, 1, 1, 2, 2, 1, 2, 2},
-      {"blocked_small_batch_b4x4", 1, 56, 56, 64, 64, 3, 3, 1, 1, 1, 1, 1, 1, 1, 4, 4},
+      {"blocked_resnet_56x56_b2x2", 32, 56, 56, 64, 64, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2},
+      {"blocked_resnet_56x56_b4x4", 32, 56, 56, 64, 64, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4, 4},
+      {"blocked_resnet_28x28_b2x4", 32, 28, 28, 128, 256, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 4},
+      {"blocked_grouped_g4_b2x2", 32, 56, 56, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 4, 1, 1, 2, 2},
+      {"blocked_pointwise_1x1_b4x4", 32, 56, 56, 128, 256, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 4, 4},
+      {"blocked_dilated_3x3_b2x2", 16, 64, 64, 64, 64, 3, 3, 2, 2, 1, 1, 2, 2, 1, 1, 1, 2, 2},
+      {"blocked_small_batch_b4x4", 1, 56, 56, 64, 64, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4, 4},
   };
 }
 
@@ -195,6 +245,14 @@ void print_verify(const std::string& tag, const VerifyResult& vr) {
 CaseRatios run_case(const Options& o, const BenchCase& bc) {
   const bool blocked = (o.custom_mode == "blocked");
   ensure(blocked || o.custom_mode == "explicit", "--custom_mode must be explicit|blocked");
+  const GradKernelAlgo grad_algo = parse_grad_algo(o.grad_algo);
+  ensure(bc.ay > 0 && bc.ax > 0, "ay and ax must be > 0");
+  if ((bc.ay != 1 || bc.ax != 1) && grad_algo != GradKernelAlgo::GemmIm2Col) {
+    throw std::runtime_error("ay/ax currently support only grad_algo=gemm");
+  }
+  if ((bc.ay != 1 || bc.ax != 1) && o.with_cudnn) {
+    throw std::runtime_error("cuDNN path does not support ay/ax != 1");
+  }
 
   CaseRatios ratios;
   Conv2DParams p;
@@ -205,6 +263,8 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
   p.dilation_h = bc.dilation_h;
   p.dilation_w = bc.dilation_w;
   p.groups = bc.groups;
+  p.ay = bc.ay;
+  p.ax = bc.ax;
 
   BlockConv2DParams bp;
   bp.conv = p;
@@ -224,20 +284,20 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
   BlockFilterKByBxRSC dw_blk;
 
   if (blocked) {
-    w_blk = BlockFilterKByBxRSC(bc.k, bp.block_by, bp.block_bx, bc.r, bc.s, bc.c / bc.groups);
+    w_blk = BlockFilterKByBxRSC(bc.k, bp.block_by, bp.block_bx, bc.r, bc.s, bc.c / bc.groups, bc.ay, bc.ax);
     const BlockConvShape sh = infer_block_conv_shape(x, w_blk, bp);
     ho = sh.base.ho;
     wo = sh.base.wo;
     cin_group = sh.base.cin_group;
-    dw_blk = BlockFilterKByBxRSC(bc.k, bp.block_by, bp.block_bx, bc.r, bc.s, bc.c / bc.groups);
+    dw_blk = BlockFilterKByBxRSC(bc.k, bp.block_by, bp.block_bx, bc.r, bc.s, bc.c / bc.groups, bc.ay, bc.ax);
     fill_random(w_blk.data, gen);
   } else {
-    w_exp = FilterKRSC(bc.r, bc.s, bc.c / bc.groups, bc.k);
+    w_exp = FilterKRSC(bc.r, bc.s, bc.c / bc.groups, bc.k, bc.ay, bc.ax);
     const ConvShape sh = infer_conv_shape(x, w_exp, p);
     ho = sh.ho;
     wo = sh.wo;
     cin_group = sh.cin_group;
-    dw_exp = FilterKRSC(bc.r, bc.s, bc.c / bc.groups, bc.k);
+    dw_exp = FilterKRSC(bc.r, bc.s, bc.c / bc.groups, bc.k, bc.ay, bc.ax);
     fill_random(w_exp.data, gen);
   }
 
@@ -280,7 +340,9 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
             << " stride=" << bc.stride_h << "x" << bc.stride_w
             << " pad=" << bc.pad_h << "x" << bc.pad_w
             << " dilation=" << bc.dilation_h << "x" << bc.dilation_w
-            << " groups=" << bc.groups;
+            << " groups=" << bc.groups
+            << " ay=" << bc.ay << " ax=" << bc.ax
+            << " grad_algo=" << grad_algo_to_string(grad_algo);
   if (blocked) {
     std::cout << " blocks=" << bp.block_by << "x" << bp.block_bx;
   }
@@ -380,9 +442,9 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
   if (do_grad) {
     BenchResult b = benchmark_cuda_op("grad", o.warmup, o.iters, flops, [&]() {
       if (blocked) {
-        launch_block_grad_nhwc(d_x, d_dy, d_dw, bc.n, bc.h, bc.w, bc.c, bc.r, bc.s, bc.k, bp);
+        launch_block_grad_nhwc(d_x, d_dy, d_dw, bc.n, bc.h, bc.w, bc.c, bc.r, bc.s, bc.k, bp, grad_algo);
       } else {
-        launch_grad_nhwc(d_x, d_dy, d_dw, bc.n, bc.h, bc.w, bc.c, bc.r, bc.s, bc.k, p);
+        launch_grad_nhwc(d_x, d_dy, d_dw, bc.n, bc.h, bc.w, bc.c, bc.r, bc.s, bc.k, p, grad_algo);
       }
     });
     print_bench("custom grad", b);
@@ -391,14 +453,14 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
     if (o.check) {
       if (blocked) {
         CUDA_CHECK(cudaMemcpy(dw_blk.ptr(), d_dw, dw_blk.elements() * sizeof(float), cudaMemcpyDeviceToHost));
-        BlockFilterKByBxRSC dw_cpu(bc.k, bp.block_by, bp.block_bx, bc.r, bc.s, bc.c / bc.groups);
+        BlockFilterKByBxRSC dw_cpu(bc.k, bp.block_by, bp.block_bx, bc.r, bc.s, bc.c / bc.groups, bc.ay, bc.ax);
         cpu_block_grad_nhwc(x, dy, bp, dw_cpu);
         VerifyResult vr = verify_tensors(dw_cpu.data, dw_blk.data, 1e-4f, 1e-3f);
         print_verify("check grad custom_vs_cpu", vr);
         if (o.with_cudnn) custom_dw = dw_blk.data;
       } else {
         CUDA_CHECK(cudaMemcpy(dw_exp.ptr(), d_dw, dw_exp.elements() * sizeof(float), cudaMemcpyDeviceToHost));
-        FilterKRSC dw_cpu(bc.r, bc.s, bc.c / bc.groups, bc.k);
+        FilterKRSC dw_cpu(bc.r, bc.s, bc.c / bc.groups, bc.k, bc.ay, bc.ax);
         cpu_grad_nhwc(x, dy, p, dw_cpu);
         VerifyResult vr = verify_tensors(dw_cpu.data, dw_exp.data, 1e-4f, 1e-3f);
         print_verify("check grad custom_vs_cpu", vr);
@@ -443,37 +505,87 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
 int main(int argc, char** argv) {
   try {
     const Options o = parse_args(argc, argv);
+    auto execute_cases = [&](const std::vector<BenchCase>& cases) {
+      const std::vector<std::string> grad_algo_names = expand_grad_algo_names(o.grad_algo);
+      const bool run_all_grad_algos = (grad_algo_names.size() > 1);
+
+      std::vector<float> fprop_ratios;
+      std::vector<float> bprop_ratios;
+      std::vector<float> grad_ratios_gemm;
+      std::vector<float> grad_ratios_algo0;
+      std::vector<float> grad_ratios_algo1;
+      std::vector<float> grad_ratios_algo2;
+
+      auto append_grad_ratio = [&](const std::string& algo_name, float ratio) {
+        if (algo_name == "gemm") push_ratio(grad_ratios_gemm, ratio);
+        else if (algo_name == "algo0") push_ratio(grad_ratios_algo0, ratio);
+        else if (algo_name == "algo1") push_ratio(grad_ratios_algo1, ratio);
+        else if (algo_name == "algo2") push_ratio(grad_ratios_algo2, ratio);
+      };
+
+      for (const BenchCase& bc : cases) {
+        if (run_all_grad_algos && o.op == "all") {
+          Options fprop_o = o;
+          fprop_o.op = "fprop";
+          fprop_o.grad_algo = "gemm";
+          push_ratio(fprop_ratios, run_case(fprop_o, bc).fprop);
+
+          Options bprop_o = o;
+          bprop_o.op = "bprop";
+          bprop_o.grad_algo = "gemm";
+          push_ratio(bprop_ratios, run_case(bprop_o, bc).bprop);
+
+          for (const std::string& algo_name : grad_algo_names) {
+            Options grad_o = o;
+            grad_o.op = "grad";
+            grad_o.grad_algo = algo_name;
+            append_grad_ratio(algo_name, run_case(grad_o, bc).grad);
+          }
+        } else if (run_all_grad_algos && o.op == "grad") {
+          for (const std::string& algo_name : grad_algo_names) {
+            Options grad_o = o;
+            grad_o.grad_algo = algo_name;
+            append_grad_ratio(algo_name, run_case(grad_o, bc).grad);
+          }
+        } else {
+          CaseRatios cr = run_case(o, bc);
+          push_ratio(fprop_ratios, cr.fprop);
+          push_ratio(bprop_ratios, cr.bprop);
+          if (!grad_algo_names.empty()) {
+            append_grad_ratio(grad_algo_names.front(), cr.grad);
+          }
+        }
+      }
+
+      if (o.with_cudnn) {
+        std::cout << "\n[summary] custom/cudnn ratio (lower is better)\n";
+        print_ratio_summary_line("fprop", fprop_ratios);
+        print_ratio_summary_line("bprop", bprop_ratios);
+        if (run_all_grad_algos) {
+          print_ratio_summary_line("grad[gemm]", grad_ratios_gemm);
+          print_ratio_summary_line("grad[algo0]", grad_ratios_algo0);
+          print_ratio_summary_line("grad[algo1]", grad_ratios_algo1);
+          print_ratio_summary_line("grad[algo2]", grad_ratios_algo2);
+        } else if (!grad_algo_names.empty()) {
+          const std::string label = std::string("grad[") + grad_algo_names.front() + "]";
+          if (grad_algo_names.front() == "gemm") print_ratio_summary_line(label.c_str(), grad_ratios_gemm);
+          else if (grad_algo_names.front() == "algo0") print_ratio_summary_line(label.c_str(), grad_ratios_algo0);
+          else if (grad_algo_names.front() == "algo1") print_ratio_summary_line(label.c_str(), grad_ratios_algo1);
+          else if (grad_algo_names.front() == "algo2") print_ratio_summary_line(label.c_str(), grad_ratios_algo2);
+        }
+      }
+    };
+
     if (o.bench_suite) {
       const bool blocked = (o.custom_mode == "blocked");
       const std::vector<BenchCase> suite = blocked ? default_blocked_bench_suite() : default_bench_suite();
-      std::cout << "Running benchmark suite (" << suite.size() << " cases)\n";
-      std::vector<float> fprop_ratios;
-      std::vector<float> bprop_ratios;
-      std::vector<float> grad_ratios;
-      for (const BenchCase& bc : suite) {
-        CaseRatios cr = run_case(o, bc);
-        if (cr.fprop > 0.0f) fprop_ratios.push_back(cr.fprop);
-        if (cr.bprop > 0.0f) bprop_ratios.push_back(cr.bprop);
-        if (cr.grad > 0.0f) grad_ratios.push_back(cr.grad);
+      const std::vector<std::string> grad_algo_names = expand_grad_algo_names(o.grad_algo);
+      std::cout << "Running benchmark suite (" << suite.size() << " cases";
+      if (grad_algo_names.size() > 1 && (o.op == "grad" || o.op == "all")) {
+        std::cout << ", grad algos=" << grad_algo_names.size();
       }
-      if (o.with_cudnn) {
-        std::cout << "\n[summary] custom/cudnn ratio (lower is better)\n";
-        if (!fprop_ratios.empty()) {
-          std::cout << "fprop min=" << std::fixed << std::setprecision(3) << vec_min(fprop_ratios)
-                    << "x median=" << vec_median(fprop_ratios)
-                    << "x max=" << vec_max(fprop_ratios) << "x\n";
-        }
-        if (!bprop_ratios.empty()) {
-          std::cout << "bprop min=" << std::fixed << std::setprecision(3) << vec_min(bprop_ratios)
-                    << "x median=" << vec_median(bprop_ratios)
-                    << "x max=" << vec_max(bprop_ratios) << "x\n";
-        }
-        if (!grad_ratios.empty()) {
-          std::cout << "grad min=" << std::fixed << std::setprecision(3) << vec_min(grad_ratios)
-                    << "x median=" << vec_median(grad_ratios)
-                    << "x max=" << vec_max(grad_ratios) << "x\n";
-        }
-      }
+      std::cout << ")\n";
+      execute_cases(suite);
     } else {
       BenchCase single{
           "single",
@@ -482,8 +594,9 @@ int main(int argc, char** argv) {
           o.stride_h, o.stride_w,
           o.dilation_h, o.dilation_w,
           o.groups,
+          o.ay, o.ax,
           o.block_by, o.block_bx};
-      (void)run_case(o, single);
+      execute_cases({single});
     }
 
     return 0;

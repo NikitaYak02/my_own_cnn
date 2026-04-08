@@ -9,7 +9,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 75)
+  set(CMAKE_CUDA_ARCHITECTURES "75" CACHE STRING "Semicolon-separated CUDA SM targets")
+endif()
+
+message(STATUS "Configuring CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "52")
+  message(WARNING "CUDA architecture 52 is a legacy target. Use a fresh build directory or one of the presets (auto, sm86, sm89, linux-auto-gcc, linux-sm86-gcc, linux-sm89-gcc) for modern GPUs.")
 endif()
 
 option(ENABLE_CUDNN "Enable cuDNN benchmark/reference" ON)
@@ -18,7 +24,7 @@ find_package(CUDAToolkit REQUIRED)
 
 function(configure_cuda_target target_name)
   target_include_directories(${target_name} PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
-  target_link_libraries(${target_name} PRIVATE CUDA::cudart)
+  target_link_libraries(${target_name} PRIVATE CUDA::cudart CUDA::cublas)
   set_target_properties(${target_name} PROPERTIES
     CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}
     CUDA_SEPARABLE_COMPILATION ON
@@ -28,6 +34,7 @@ endfunction()
 add_executable(conv_bench
   bmm.cu
   src/main.cpp
+  src/conv_layer.cu
   src/cpu_ref.cpp
   src/cuda_kernels.cu
   src/cuda_utils.cpp
@@ -44,7 +51,6 @@ add_executable(bmm_bench
 )
 
 configure_cuda_target(bmm_bench)
-target_link_libraries(bmm_bench PRIVATE CUDA::cublas)
 
 add_executable(bmm_test
   bmm.cu
@@ -52,7 +58,6 @@ add_executable(bmm_test
 )
 
 configure_cuda_target(bmm_test)
-target_link_libraries(bmm_test PRIVATE CUDA::cublas)
 
 add_executable(arcface_test
   arcface.cu
@@ -71,21 +76,106 @@ add_executable(quant_conv_test
 
 configure_cuda_target(quant_conv_test)
 
+add_executable(quant_error_u8
+  bmm.cu
+  quant_error_u8.cu
+  src/cpu_ref.cpp
+  src/cuda_kernels.cu
+  src/cuda_utils.cpp
+)
+
+configure_cuda_target(quant_error_u8)
+
+add_executable(conv_grad_check
+  conv_grad_check.cpp
+  src/cpu_ref.cpp
+)
+
+target_include_directories(conv_grad_check PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
+set_target_properties(conv_grad_check PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+)
+
+add_executable(conv_chain_test
+  bmm.cu
+  conv_chain_test.cu
+  src/cpu_ref.cpp
+  src/cuda_kernels.cu
+  src/cuda_utils.cpp
+  src/verify.cpp
+)
+
+configure_cuda_target(conv_chain_test)
+
+add_executable(conv_large_workspace_test
+  bmm.cu
+  conv_large_workspace_test.cu
+  src/cuda_kernels.cu
+  src/cuda_utils.cpp
+)
+
+configure_cuda_target(conv_large_workspace_test)
+
+add_executable(conv_layer_test
+  bmm.cu
+  conv_layer_test.cu
+  src/conv_layer.cu
+  src/cpu_ref.cpp
+  src/cuda_kernels.cu
+  src/cuda_utils.cpp
+  src/verify.cpp
+)
+
+configure_cuda_target(conv_layer_test)
+
 if(ENABLE_CUDNN)
-  find_path(CUDNN_INCLUDE_DIR cudnn.h
-    HINTS
-      $ENV{CUDNN_ROOT}
-      ${CUDAToolkit_INCLUDE_DIRS}
-      /usr/include
-      /usr/local/cuda/include
+  set(CUDNN_ROOT_HINTS
+    $ENV{CUDNN_ROOT}
+    $ENV{CUDNN_HOME}
+    "C:/Program Files/NVIDIA/CUDNN"
+    "C:/Program Files/NVIDIA/CUDNN/v9.19"
+    /usr
+    /usr/local
+    /usr/local/cuda
+    /opt/cudnn
   )
 
-  find_library(CUDNN_LIBRARY cudnn
+  find_path(CUDNN_INCLUDE_DIR cudnn.h
     HINTS
-      $ENV{CUDNN_ROOT}
+      ${CUDNN_ROOT_HINTS}
+      ${CUDAToolkit_INCLUDE_DIRS}
+      /usr/include
+      /usr/include/x86_64-linux-gnu
+      /usr/local/include
+      /usr/local/cuda/include
+    PATH_SUFFIXES
+      include
+      include/${CUDAToolkit_VERSION_MAJOR}.${CUDAToolkit_VERSION_MINOR}
+      include/12.9
+      include/13.1
+      targets/x86_64-linux/include
+  )
+
+  find_library(CUDNN_LIBRARY
+    NAMES cudnn cudnn64_9
+    HINTS
+      ${CUDNN_ROOT_HINTS}
       /usr/lib
+      /usr/lib/x86_64-linux-gnu
+      /usr/local/lib
       /usr/local/cuda/lib64
-      "C:/Program Files/NVIDIA/CUDNN"
+    PATH_SUFFIXES
+      lib
+      lib64
+      lib/x64
+      lib/${CUDAToolkit_VERSION_MAJOR}.${CUDAToolkit_VERSION_MINOR}/x64
+      lib/${CUDAToolkit_VERSION_MAJOR}.${CUDAToolkit_VERSION_MINOR}
+      lib/12.9/x64
+      lib/12.9
+      lib/13.1/x64
+      lib/13.1
+      targets/x86_64-linux/lib
   )
 
   if(CUDNN_INCLUDE_DIR AND CUDNN_LIBRARY)
@@ -127,4 +217,16 @@ if(BUILD_TESTING)
 
   add_test(NAME quant_conv_test COMMAND quant_conv_test)
   set_tests_properties(quant_conv_test PROPERTIES LABELS "quant_conv")
+
+  add_test(NAME conv_grad_check_128x128 COMMAND conv_grad_check)
+  set_tests_properties(conv_grad_check_128x128 PROPERTIES LABELS "conv;grad")
+
+  add_test(NAME conv_chain_test COMMAND $<TARGET_FILE:conv_chain_test>)
+  set_tests_properties(conv_chain_test PROPERTIES LABELS "conv;fprop;regression")
+
+  add_test(NAME conv_large_workspace_test COMMAND $<TARGET_FILE:conv_large_workspace_test>)
+  set_tests_properties(conv_large_workspace_test PROPERTIES LABELS "conv;memory;regression")
+
+  add_test(NAME conv_layer_test COMMAND $<TARGET_FILE:conv_layer_test>)
+  set_tests_properties(conv_layer_test PROPERTIES LABELS "conv;train;regression")
 endif()
