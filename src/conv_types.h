@@ -34,6 +34,11 @@ struct BlockConv2DParams {
   int block_bx = 1;
 };
 
+enum class BlockBiasMode {
+  PerBlock = 0,
+  Shared = 1,
+};
+
 struct TensorNHWC {
   int n = 0;
   int h = 0;
@@ -176,6 +181,12 @@ __host__ __device__ inline size_t idx_kbybxrsc(int k, int by, int bx, int r, int
   return (((((static_cast<size_t>(k) * By + by) * Bx + bx) * R + r) * S + s) * C + c);
 }
 
+__host__ __device__ inline size_t idx_block_bias(int k, int by, int bx, int by_count, int bx_count, BlockBiasMode mode) {
+  const int by_idx = (mode == BlockBiasMode::PerBlock) ? by : 0;
+  const int bx_idx = (mode == BlockBiasMode::PerBlock) ? bx : 0;
+  return (static_cast<size_t>(k) * by_count + by_idx) * bx_count + bx_idx;
+}
+
 struct VerifyResult {
   float max_abs_err = 0.0f;
   float max_rel_err = 0.0f;
@@ -193,9 +204,11 @@ struct BenchResult {
 void cpu_fprop_nhwc(const TensorNHWC& x, const FilterKRSC& w, const Conv2DParams& p, TensorNHWC& y);
 void cpu_bprop_nhwc(const TensorNHWC& dy, const FilterKRSC& w, const Conv2DParams& p, TensorNHWC& dx);
 void cpu_grad_nhwc(const TensorNHWC& x, const TensorNHWC& dy, const Conv2DParams& p, FilterKRSC& dw);
-void cpu_block_fprop_nhwc(const TensorNHWC& x, const BlockFilterKByBxRSC& w, const BlockConv2DParams& p, TensorNHWC& y);
+void cpu_block_fprop_nhwc(const TensorNHWC& x, const BlockFilterKByBxRSC& w, const BlockConv2DParams& p, TensorNHWC& y,
+                          const float* bias = nullptr, BlockBiasMode bias_mode = BlockBiasMode::PerBlock);
 void cpu_block_bprop_nhwc(const TensorNHWC& dy, const BlockFilterKByBxRSC& w, const BlockConv2DParams& p, TensorNHWC& dx);
-void cpu_block_grad_nhwc(const TensorNHWC& x, const TensorNHWC& dy, const BlockConv2DParams& p, BlockFilterKByBxRSC& dw);
+void cpu_block_grad_nhwc(const TensorNHWC& x, const TensorNHWC& dy, const BlockConv2DParams& p, BlockFilterKByBxRSC& dw,
+                         float* dbias = nullptr, BlockBiasMode bias_mode = BlockBiasMode::PerBlock);
 
 namespace conv_quant_detail {
 
@@ -282,13 +295,15 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                       const Conv2DParams& p);
 void launch_block_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
                              int n, int h, int w, int c, int r, int s, int k,
-                             const BlockConv2DParams& p);
+                             const BlockConv2DParams& p,
+                             const float* d_bias = nullptr, BlockBiasMode bias_mode = BlockBiasMode::PerBlock);
 void launch_block_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
                              int n, int h, int w, int c, int r, int s, int k,
                              const BlockConv2DParams& p);
 void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                             int n, int h, int w, int c, int r, int s, int k,
-                            const BlockConv2DParams& p);
+                            const BlockConv2DParams& p,
+                            float* d_dbias = nullptr, BlockBiasMode bias_mode = BlockBiasMode::PerBlock);
 
 template <nnalgebra::DataType Tin>
 inline void launch_fprop_nhwc_qi32(const float* d_x, const float* d_w, int32_t* d_y,

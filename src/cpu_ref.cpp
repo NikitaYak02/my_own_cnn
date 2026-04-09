@@ -229,7 +229,8 @@ void cpu_grad_nhwc(const TensorNHWC& x, const TensorNHWC& dy, const Conv2DParams
   }
 }
 
-void cpu_block_fprop_nhwc(const TensorNHWC& x, const BlockFilterKByBxRSC& w, const BlockConv2DParams& p, TensorNHWC& y) {
+void cpu_block_fprop_nhwc(const TensorNHWC& x, const BlockFilterKByBxRSC& w, const BlockConv2DParams& p, TensorNHWC& y,
+                          const float* bias, BlockBiasMode bias_mode) {
   const BlockConvShape shape = infer_block_conv_shape(x, w, p);
   y = TensorNHWC(x.n, shape.base.ho, shape.base.wo, w.k);
   std::fill(y.data.begin(), y.data.end(), 0.0f);
@@ -257,6 +258,9 @@ void cpu_block_fprop_nhwc(const TensorNHWC& x, const BlockFilterKByBxRSC& w, con
                   acc += xv * wv;
                 }
               }
+            }
+            if (bias) {
+              acc += bias[idx_block_bias(kout_base + ko, by, bx, w.by, w.bx, bias_mode)];
             }
             y.data[idx_nhwc(n, ho, wo, kout_base + ko, shape.base.ho, shape.base.wo, w.k)] = acc;
           }
@@ -311,13 +315,18 @@ void cpu_block_bprop_nhwc(const TensorNHWC& dy, const BlockFilterKByBxRSC& w, co
   }
 }
 
-void cpu_block_grad_nhwc(const TensorNHWC& x, const TensorNHWC& dy, const BlockConv2DParams& p, BlockFilterKByBxRSC& dw) {
+void cpu_block_grad_nhwc(const TensorNHWC& x, const TensorNHWC& dy, const BlockConv2DParams& p, BlockFilterKByBxRSC& dw,
+                         float* dbias, BlockBiasMode bias_mode) {
   const BlockConvShape shape = infer_block_conv_shape(x, dw, p);
   if (dy.h != shape.base.ho || dy.w != shape.base.wo || dy.c != dw.k || dy.n != x.n) {
     throw std::runtime_error("blocked grad dy shape mismatch");
   }
 
   std::fill(dw.data.begin(), dw.data.end(), 0.0f);
+  if (dbias) {
+    const size_t bias_elems = static_cast<size_t>(dw.k) * dw.by * dw.bx;
+    std::fill(dbias, dbias + bias_elems, 0.0f);
+  }
   for (int by = 0; by < dw.by; ++by) {
     const int ho0 = by * shape.block_ho;
     for (int bx = 0; bx < dw.bx; ++bx) {
@@ -342,6 +351,9 @@ void cpu_block_grad_nhwc(const TensorNHWC& x, const TensorNHWC& dy, const BlockC
                       const float xv = x.data[idx_nhwc(n, hi, wi, cin_base + ci, x.h, x.w, x.c)];
                       const float dyv = dy.data[idx_nhwc(n, ho, wo, kout_base + ko, dy.h, dy.w, dy.c)];
                       acc += xv * dyv;
+                      if (dbias && rr == 0 && ss == 0 && ci == 0) {
+                        dbias[idx_block_bias(kout_base + ko, by, bx, dw.by, dw.bx, bias_mode)] += dyv;
+                      }
                     }
                   }
                 }

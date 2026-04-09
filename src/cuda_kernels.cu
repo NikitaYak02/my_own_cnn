@@ -433,7 +433,10 @@ __global__ void unpack_matrix_to_nhwc_group_block_kernel(const float* __restrict
                                                          int n, int h, int w, int c,
                                                          int ho_start, int wo_start,
                                                          int block_ho, int block_wo,
-                                                         int c_base, int c_count) {
+                                                         int c_base, int c_count,
+                                                         const float* __restrict__ bias,
+                                                         int by, int bx, int by_count, int bx_count,
+                                                         int bias_mode) {
   const int m = n * block_ho * block_wo;
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = m * c_count;
@@ -447,7 +450,38 @@ __global__ void unpack_matrix_to_nhwc_group_block_kernel(const float* __restrict
   const int lho = rem / block_wo;
   const int lwo = rem - lho * block_wo;
 
-  dst[idx_nhwc(n_idx, ho_start + lho, wo_start + lwo, c_base + col, h, w, c)] = src[idx];
+  float v = src[idx];
+  if (bias) {
+    const BlockBiasMode mode = static_cast<BlockBiasMode>(bias_mode);
+    v += bias[idx_block_bias(c_base + col, by, bx, by_count, bx_count, mode)];
+  }
+  dst[idx_nhwc(n_idx, ho_start + lho, wo_start + lwo, c_base + col, h, w, c)] = v;
+}
+
+__global__ void accum_block_bias_grad_kernel(const float* __restrict__ dy,
+                                             float* __restrict__ dbias,
+                                             int n, int h, int w, int c,
+                                             int ho_start, int wo_start,
+                                             int block_ho, int block_wo,
+                                             int c_base, int c_count,
+                                             int by, int bx, int by_count, int bx_count,
+                                             int bias_mode) {
+  const int m = n * block_ho * block_wo;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = m * c_count;
+  if (idx >= total) return;
+
+  const int row = idx / c_count;
+  const int col = idx - row * c_count;
+
+  const int n_idx = row / (block_ho * block_wo);
+  const int rem = row - n_idx * (block_ho * block_wo);
+  const int lho = rem / block_wo;
+  const int lwo = rem - lho * block_wo;
+
+  const float dyv = dy[idx_nhwc(n_idx, ho_start + lho, wo_start + lwo, c_base + col, h, w, c)];
+  const BlockBiasMode mode = static_cast<BlockBiasMode>(bias_mode);
+  atomicAdd(&dbias[idx_block_bias(c_base + col, by, bx, by_count, bx_count, mode)], dyv);
 }
 
 __global__ void col2im_accum_nhwc_block_kernel(const float* __restrict__ dcol,
@@ -904,7 +938,8 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
 
 void launch_block_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
                              int n, int h, int w, int c, int r, int s, int k,
-                             const BlockConv2DParams& p) {
+                             const BlockConv2DParams& p,
+                             const float* d_bias, BlockBiasMode bias_mode) {
   TensorNHWC x_shape(n, h, w, c);
   BlockFilterKByBxRSC w_shape(k, p.block_by, p.block_bx, r, s, c / p.conv.groups);
   const BlockConvShape sh = infer_block_conv_shape(x_shape, w_shape, p);
@@ -951,7 +986,10 @@ void launch_block_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
                                                                    n, sh.base.ho, sh.base.wo, k,
                                                                    ho_start, wo_start,
                                                                    sh.block_ho, sh.block_wo,
-                                                                   kout_base, sh.base.kout_group);
+                                                                   kout_base, sh.base.kout_group,
+                                                                   d_bias,
+                                                                   by, bx, p.block_by, p.block_bx,
+                                                                   static_cast<int>(bias_mode));
       }
     }
   }
@@ -1020,7 +1058,8 @@ void launch_block_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
 
 void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                             int n, int h, int w, int c, int r, int s, int k,
-                            const BlockConv2DParams& p) {
+                            const BlockConv2DParams& p,
+                            float* d_dbias, BlockBiasMode bias_mode) {
   TensorNHWC x_shape(n, h, w, c);
   BlockFilterKByBxRSC w_shape(k, p.block_by, p.block_bx, r, s, c / p.conv.groups);
   const BlockConvShape sh = infer_block_conv_shape(x_shape, w_shape, p);
@@ -1038,6 +1077,9 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
   float* d_dwg = ws.d_dwg;
 
   CUDA_CHECK(cudaMemset(d_dw, 0, static_cast<size_t>(k) * p.block_by * p.block_bx * r * s * sh.base.cin_group * sizeof(float)));
+  if (d_dbias) {
+    CUDA_CHECK(cudaMemset(d_dbias, 0, static_cast<size_t>(k) * p.block_by * p.block_bx * sizeof(float)));
+  }
 
   const int t = 256;
   for (int g = 0; g < p.conv.groups; ++g) {
@@ -1066,6 +1108,15 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                                                               ho_start, wo_start,
                                                               sh.block_ho, sh.block_wo,
                                                               kout_base, sh.base.kout_group);
+        if (d_dbias) {
+          accum_block_bias_grad_kernel<<<blocks_dy, t>>>(d_dy, d_dbias,
+                                                         n, sh.base.ho, sh.base.wo, k,
+                                                         ho_start, wo_start,
+                                                         sh.block_ho, sh.block_wo,
+                                                         kout_base, sh.base.kout_group,
+                                                         by, bx, p.block_by, p.block_bx,
+                                                         static_cast<int>(bias_mode));
+        }
 
         bmm_matmul(d_col, d_dy_mat, d_dwg, 1, kdim, ncol, m_block, BMM_TRANSPOSE_YES, BMM_TRANSPOSE_NONE);
 
