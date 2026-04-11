@@ -9,17 +9,21 @@
 namespace {
 
 // Tile geometry for the custom row-major GEMM kernel.
-// A 16x16 thread block (256 threads) computes a 32x32 output tile, so each
-// thread accumulates a 2x2 register tile.
-constexpr int kBlockRows = 32;
-constexpr int kBlockCols = 32;
-constexpr int kBlockDepth = 8;
-constexpr int kThreadRows = 2;
-constexpr int kThreadCols = 2;
+// By default a 16x16 thread block (256 threads) computes a 32x32 output tile,
+// so each thread accumulates a 2x2 register tile. The per-thread register tile
+// is configurable at runtime through BmmTileConfig.
+constexpr int kDefaultBlockRows = 32;
+constexpr int kDefaultBlockCols = 32;
+constexpr int kDefaultBlockDepth = 8;
+constexpr int kDefaultThreadRows = 2;
+constexpr int kDefaultThreadCols = 2;
+constexpr int kMaxThreadRows = 8;
+constexpr int kMaxThreadCols = 8;
 constexpr int kSharedPad = 1;
+constexpr size_t kMaxTileSharedBytes = 48ull * 1024ull;
 
-static_assert(kBlockRows % kThreadRows == 0, "row tile must divide block rows");
-static_assert(kBlockCols % kThreadCols == 0, "col tile must divide block cols");
+static_assert(kDefaultBlockRows % kDefaultThreadRows == 0, "row tile must divide block rows");
+static_assert(kDefaultBlockCols % kDefaultThreadCols == 0, "col tile must divide block cols");
 
 constexpr int kCublasTransposeAPathMinK = 512;
 constexpr size_t kCublasLtWorkspaceBytes = 64ull * 1024ull * 1024ull;
@@ -236,14 +240,92 @@ static bool launch_cublas_transpose_b_path(
     return st == CUBLAS_STATUS_SUCCESS;
 }
 
+static BmmTileConfig default_tile_config() {
+    return BmmTileConfig{
+        kDefaultBlockRows,
+        kDefaultBlockCols,
+        kDefaultBlockDepth,
+        kDefaultThreadRows,
+        kDefaultThreadCols,
+    };
+}
+
+static BmmTileConfig normalize_tile_config(BmmTileConfig cfg) {
+    if (cfg.thread_rows == 0) {
+        cfg.thread_rows = kDefaultThreadRows;
+    }
+    if (cfg.thread_cols == 0) {
+        cfg.thread_cols = kDefaultThreadCols;
+    }
+    return cfg;
+}
+
+static BmmTileConfig& get_tile_config() {
+    static BmmTileConfig cfg = default_tile_config();
+    return cfg;
+}
+
+static BmmTileLaunchInfo& get_last_launch_info_storage() {
+    static BmmTileLaunchInfo info{
+        {kDefaultBlockRows, kDefaultBlockCols, kDefaultBlockDepth, kDefaultThreadRows, kDefaultThreadCols},
+        kDefaultBlockCols / kDefaultThreadCols,
+        kDefaultBlockRows / kDefaultThreadRows,
+        static_cast<int>(((static_cast<size_t>(kDefaultBlockRows) * (kDefaultBlockDepth + kSharedPad)) +
+                          (static_cast<size_t>(kDefaultBlockDepth) * (kDefaultBlockCols + kSharedPad))) * sizeof(float)),
+    };
+    return info;
+}
+
+static size_t tile_shared_bytes(const BmmTileConfig& cfg) {
+    return (static_cast<size_t>(cfg.block_rows) * (cfg.block_depth + kSharedPad) +
+            static_cast<size_t>(cfg.block_depth) * (cfg.block_cols + kSharedPad)) * sizeof(float);
+}
+
+static bool validate_tile_config(const BmmTileConfig& cfg) {
+    const BmmTileConfig norm = normalize_tile_config(cfg);
+    if (norm.block_rows <= 0 || norm.block_cols <= 0 || norm.block_depth <= 0) {
+        return false;
+    }
+    if (norm.thread_rows <= 0 || norm.thread_cols <= 0) {
+        return false;
+    }
+    if (norm.thread_rows > kMaxThreadRows || norm.thread_cols > kMaxThreadCols) {
+        return false;
+    }
+    if ((norm.block_rows % norm.thread_rows) != 0 || (norm.block_cols % norm.thread_cols) != 0) {
+        return false;
+    }
+
+    const int threads_x = norm.block_cols / norm.thread_cols;
+    const int threads_y = norm.block_rows / norm.thread_rows;
+    if (threads_x <= 0 || threads_y <= 0) {
+        return false;
+    }
+    if (static_cast<size_t>(threads_x) * threads_y > 1024u) {
+        return false;
+    }
+    if (tile_shared_bytes(norm) > kMaxTileSharedBytes) {
+        return false;
+    }
+    return true;
+}
+
+static void record_last_launch_info(const BmmTileConfig& cfg) {
+    BmmTileLaunchInfo& info = get_last_launch_info_storage();
+    info.tile = cfg;
+    info.threads_x = cfg.block_cols / cfg.thread_cols;
+    info.threads_y = cfg.block_rows / cfg.thread_rows;
+    info.shared_mem_bytes = static_cast<int>(tile_shared_bytes(cfg));
+}
+
 }  // namespace
 
 /* ================================================================== */
 /*                  REGISTER-TILED BATCHED MATMUL                     */
 /* ================================================================== */
 /*                                                                    */
-/*  One block computes a 32x32 output tile using 16x16 = 256 threads. */
-/*  Each thread accumulates a 2x2 output fragment in registers.       */
+/*  One block computes a configurable output tile.                    */
+/*  Each thread accumulates a configurable register fragment.         */
 /*                                                                    */
 /*  The loader is specialized at compile time for the four transpose  */
 /*  combinations so the three hot paths used by the project keep      */
@@ -257,7 +339,12 @@ __global__ void bmm_tiled_kernel(
     T* __restrict__ C,
     int batch, int M, int N, int K,
     int tiles_m, int tiles_n,
-    size_t tile_block_offset)
+    size_t tile_block_offset,
+    int block_rows,
+    int block_cols,
+    int block_depth,
+    int thread_rows,
+    int thread_cols)
 {
     // Linearize output tiles so large M or batch values do not overflow
     // gridDim.y / gridDim.z, which are capped at 65535.
@@ -275,10 +362,10 @@ __global__ void bmm_tiled_kernel(
     const int ty = threadIdx.y;
     const int tid = ty * blockDim.x + tx;
 
-    const int tile_row = tile_row_idx * kBlockRows;
-    const int tile_col = tile_col_idx * kBlockCols;
-    const int local_row = ty * kThreadRows;
-    const int local_col = tx * kThreadCols;
+    const int tile_row = tile_row_idx * block_rows;
+    const int tile_col = tile_col_idx * block_cols;
+    const int local_row = ty * thread_rows;
+    const int local_col = tx * thread_cols;
     const int out_row0 = tile_row + local_row;
     const int out_col0 = tile_col + local_col;
 
@@ -294,13 +381,13 @@ __global__ void bmm_tiled_kernel(
     T acc[kThreadRows][kThreadCols] = {{static_cast<T>(0), static_cast<T>(0)},
                                        {static_cast<T>(0), static_cast<T>(0)}};
 
-    for (int k0 = 0; k0 < K; k0 += kBlockDepth) {
+    for (int k0 = 0; k0 < K; k0 += block_depth) {
         // Cooperative tile load. Compile-time specialization keeps the
         // addressing formula simple inside the hot loop for each transpose
         // combination.
-        if constexpr (TRANS_A) {
-            const int load_k = tid / kBlockRows;
-            const int load_m = tid % kBlockRows;
+        for (int elem = tid; elem < block_rows * block_depth; elem += num_threads) {
+            const int load_m = elem / block_depth;
+            const int load_k = elem - load_m * block_depth;
             const int g_m = tile_row + load_m;
             const int g_k = k0 + load_k;
             As[load_m][load_k] =
@@ -348,7 +435,7 @@ __global__ void bmm_tiled_kernel(
         __syncthreads();
     }
 
-    // Store the thread-local 2x2 output fragment with boundary checks for
+    // Store the thread-local output fragment with boundary checks for
     // partially covered tiles on matrix edges.
     #pragma unroll
     for (int i = 0; i < kThreadRows; ++i) {
@@ -385,11 +472,15 @@ static void launch_bmm_kernel(
         return;
     }
 
-    dim3 block(kBlockCols / kThreadCols, kBlockRows / kThreadRows);
-    const int tiles_m = (M + kBlockRows - 1) / kBlockRows;
-    const int tiles_n = (N + kBlockCols - 1) / kBlockCols;
+    const BmmTileConfig cfg = get_tile_config();
+    dim3 block(cfg.block_cols / cfg.thread_cols, cfg.block_rows / cfg.thread_rows);
+    const int tiles_m = (M + cfg.block_rows - 1) / cfg.block_rows;
+    const int tiles_n = (N + cfg.block_cols - 1) / cfg.block_cols;
     const size_t total_tiles = static_cast<size_t>(batch) * tiles_m * tiles_n;
+    const size_t shared_bytes = tile_shared_bytes(cfg);
     constexpr unsigned int kMaxGridX = 0x7fffffffu;
+
+    record_last_launch_info(cfg);
 
     for (size_t tile_offset = 0; tile_offset < total_tiles; ) {
         const size_t remaining_tiles = total_tiles - tile_offset;
@@ -403,10 +494,6 @@ static void launch_bmm_kernel(
         tile_offset += grid_x;
     }
 }
-
-/* ================================================================== */
-/*                          HOST  WRAPPERS                            */
-/* ================================================================== */
 
 static void bmm_matmul_impl(
     const float* A, const float* B, float* C,
@@ -491,7 +578,7 @@ extern "C" void bmm_matmul_accum(
 }
 
 extern "C" void bmm_matmul_i32(
-    const int32_t* A, const int32_t* B, int32_t* C,
+    const float* A, const float* B, float* C,
     int batch, int M, int N, int K,
     int trans_a, int trans_b)
 {

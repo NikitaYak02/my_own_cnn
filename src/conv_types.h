@@ -96,12 +96,18 @@ struct BlockFilterKByBxRSC {
   const float* ptr() const { return data.data(); }
 };
 
+// Logical LinQuantI32 accumulator values are stored in float buffers so the
+// quantized path can reuse the tiled float GEMM implementation. Callers should
+// still treat these values as integer-domain accumulators paired with
+// LinQuantI32 quantization parameters.
+using QuantizedAccumStorage = float;
+
 struct TensorNHWCI32 {
   int n = 0;
   int h = 0;
   int w = 0;
   int c = 0;
-  std::vector<int32_t> data;
+  std::vector<QuantizedAccumStorage> data;
 
   TensorNHWCI32() = default;
   TensorNHWCI32(int n_, int h_, int w_, int c_)
@@ -109,8 +115,8 @@ struct TensorNHWCI32 {
         data(static_cast<size_t>(n_) * h_ * w_ * c_) {}
 
   size_t elements() const { return static_cast<size_t>(n) * h * w * c; }
-  int32_t* ptr() { return data.data(); }
-  const int32_t* ptr() const { return data.data(); }
+  QuantizedAccumStorage* ptr() { return data.data(); }
+  const QuantizedAccumStorage* ptr() const { return data.data(); }
 };
 
 struct ConvShape {
@@ -321,7 +327,7 @@ inline Conv2DRuntimeConfig make_conv2d_runtime_config(int n, int h, int w, int c
   cfg.grad_split_k = conv_runtime_detail::select_grad_split_k(cfg.m, static_cast<size_t>(cfg.grad_slice_weights));
   cfg.grad_deterministic_rows_per_chunk = conv_runtime_detail::ceil_div(cfg.m, cfg.grad_split_k);
   cfg.grad_reduce_blocks = conv_runtime_detail::ceil_div(cfg.grad_slice_weights, 256);
-  cfg.can_vec4 = (cfg.shape.cin_group % 4 == 0) && (cfg.shape.cin_group >= 4) && ((c % 4) == 0);
+  cfg.can_vec4 = false;
   cfg.input_elements = static_cast<size_t>(n) * h * w * c;
   cfg.output_elements = static_cast<size_t>(n) * cfg.shape.ho * cfg.shape.wo * weights.k;
   cfg.weight_elements = weights.elements();
@@ -441,25 +447,25 @@ void cpu_block_fprop_nhwc_qi32_s5(const TensorNHWC& x, const BlockFilterKByBxRSC
                                   const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* f_qp,
                                   nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp);
 
-void launch_fprop_nhwc_qi32_u8(const float* d_x, const float* d_w, int32_t* d_y,
+void launch_fprop_nhwc_qi32_u8(const float* d_x, const float* d_w, QuantizedAccumStorage* d_y,
                                int n, int h, int w, int c, int r, int s, int k,
                                const Conv2DParams& p,
                                const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* in_qp,
                                const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* f_qp,
                                nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp);
-void launch_fprop_nhwc_qi32_s5(const float* d_x, const float* d_w, int32_t* d_y,
+void launch_fprop_nhwc_qi32_s5(const float* d_x, const float* d_w, QuantizedAccumStorage* d_y,
                                int n, int h, int w, int c, int r, int s, int k,
                                const Conv2DParams& p,
                                const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* in_qp,
                                const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* f_qp,
                                nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp);
-void launch_block_fprop_nhwc_qi32_u8(const float* d_x, const float* d_w, int32_t* d_y,
+void launch_block_fprop_nhwc_qi32_u8(const float* d_x, const float* d_w, QuantizedAccumStorage* d_y,
                                      int n, int h, int w, int c, int r, int s, int k,
                                      const BlockConv2DParams& p,
                                      const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* in_qp,
                                      const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* f_qp,
                                      nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp);
-void launch_block_fprop_nhwc_qi32_s5(const float* d_x, const float* d_w, int32_t* d_y,
+void launch_block_fprop_nhwc_qi32_s5(const float* d_x, const float* d_w, QuantizedAccumStorage* d_y,
                                      int n, int h, int w, int c, int r, int s, int k,
                                      const BlockConv2DParams& p,
                                      const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* in_qp,
@@ -586,7 +592,7 @@ void invalidate_block_conv_weight_cache(const float* d_w);
 void invalidate_all_conv_workspace_caches();
 
 template <nnalgebra::DataType Tin>
-inline void launch_fprop_nhwc_qi32(const float* d_x, const float* d_w, int32_t* d_y,
+inline void launch_fprop_nhwc_qi32(const float* d_x, const float* d_w, QuantizedAccumStorage* d_y,
                                    int n, int h, int w, int c, int r, int s, int k,
                                    const Conv2DParams& p,
                                    const nnalgebra::QuantizationParameters<Tin>* in_qp,
@@ -604,7 +610,7 @@ inline void launch_fprop_nhwc_qi32(const float* d_x, const float* d_w, int32_t* 
 }
 
 template <nnalgebra::DataType Tin>
-inline void launch_block_fprop_nhwc_qi32(const float* d_x, const float* d_w, int32_t* d_y,
+inline void launch_block_fprop_nhwc_qi32(const float* d_x, const float* d_w, QuantizedAccumStorage* d_y,
                                          int n, int h, int w, int c, int r, int s, int k,
                                          const BlockConv2DParams& p,
                                          const nnalgebra::QuantizationParameters<Tin>* in_qp,

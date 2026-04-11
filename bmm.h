@@ -34,6 +34,26 @@ enum BmmTranspose {
     BMM_TRANSPOSE_YES = 1,
 };
 
+typedef struct BmmTileConfig {
+    int block_rows;
+    int block_cols;
+    int block_depth;
+    int thread_rows;
+    int thread_cols;
+} BmmTileConfig;
+
+typedef struct BmmTileLaunchInfo {
+    BmmTileConfig tile;
+    int threads_x;
+    int threads_y;
+    int shared_mem_bytes;
+} BmmTileLaunchInfo;
+
+int bmm_set_tile_config(const BmmTileConfig* config);
+void bmm_get_tile_config(BmmTileConfig* config);
+void bmm_reset_tile_config(void);
+void bmm_get_last_launch_info(BmmTileLaunchInfo* info);
+
 void bmm_matmul(
     const float* A, const float* B, float* C,
     int batch, int M, int N, int K,
@@ -76,7 +96,7 @@ void bmm_bprop(
 
 #ifdef __cplusplus
 void bmm_matmul_i32(
-    const int32_t* A, const int32_t* B, int32_t* C,
+    const float* A, const float* B, float* C,
     int batch, int M, int N, int K,
     int trans_a, int trans_b);
 #endif

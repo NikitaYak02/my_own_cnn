@@ -197,7 +197,7 @@ int main() {
 
     DeviceBuffer<float> d_x;
     DeviceBuffer<float> d_w;
-    DeviceBuffer<int32_t> d_y;
+    DeviceBuffer<QuantizedAccumStorage> d_y;
     DeviceBuffer<U8QParams> d_in_qp;
     DeviceBuffer<U8QParams> d_f_qp;
     DeviceBuffer<I32QParams> d_out_qp;
@@ -222,7 +222,7 @@ int main() {
 
     TensorNHWCI32 y_q_cuda(y_q_cpu.n, y_q_cpu.h, y_q_cpu.w, y_q_cpu.c);
     std::vector<I32QParams> out_qp_cuda(static_cast<size_t>(x.n));
-    CUDA_CHECK(cudaMemcpy(y_q_cuda.ptr(), d_y.ptr, y_q_cuda.elements() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(y_q_cuda.ptr(), d_y.ptr, y_q_cuda.elements() * sizeof(QuantizedAccumStorage), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(out_qp_cuda.data(), d_out_qp.ptr, out_qp_cuda.size() * sizeof(I32QParams), cudaMemcpyDeviceToHost));
 
     const std::vector<float> y_deq_cuda = dequantize_output(y_q_cuda, out_qp_cuda);

@@ -28,8 +28,10 @@ inline int32_t centered_input_value(const TensorNHWC& x,
 template <nnalgebra::DataType Tin>
 inline int32_t centered_weight_value(const FilterKRSC& w,
                                      int k, int r, int s, int c,
+                                     int ay, int ax,
                                      const nnalgebra::QuantizationParameters<Tin>* f_qp) {
-  return static_cast<int32_t>(w.data[idx_krsc(k, r, s, c, w.r, w.s, w.cin_per_group)]) -
+  return static_cast<int32_t>(w.data[idx_krsc(k, r, s, c, ay, ax,
+                                              w.r, w.s, w.cin_per_group, w.ay, w.ax)]) -
          nnalgebra::getZeroPoint(*f_qp);
 }
 
@@ -44,9 +46,10 @@ inline int32_t centered_weight_value(const FilterKRSC& w,
 template <nnalgebra::DataType Tin>
 inline int32_t centered_block_weight_value(const BlockFilterKByBxRSC& w,
                                            int k, int by, int bx, int r, int s, int c,
+                                           int ay, int ax,
                                            const nnalgebra::QuantizationParameters<Tin>* f_qp) {
-  return static_cast<int32_t>(w.data[idx_kbybxrsc(k, by, bx, r, s, c,
-                                                  w.by, w.bx, w.r, w.s, w.cin_per_group)]) -
+  return static_cast<int32_t>(w.data[idx_kbybxrsc(k, by, bx, r, s, c, ay, ax,
+                                                  w.by, w.bx, w.r, w.s, w.cin_per_group, w.ay, w.ax)]) -
          nnalgebra::getZeroPoint(*f_qp);
 }
 
@@ -79,7 +82,7 @@ void cpu_fprop_nhwc_qi32_impl(const TensorNHWC& x, const FilterKRSC& w, const Co
                               nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp) {
   const ConvShape shape = infer_conv_shape(x, w, p);
   y = TensorNHWCI32(x.n, shape.ho, shape.wo, w.k);
-  std::fill(y.data.begin(), y.data.end(), 0);
+  std::fill(y.data.begin(), y.data.end(), 0.0f);
   populate_output_qparams(x.n, in_qp, f_qp, out_qp);
 
   for (int n = 0; n < x.n; ++n) {
@@ -108,7 +111,8 @@ void cpu_fprop_nhwc_qi32_impl(const TensorNHWC& x, const FilterKRSC& w, const Co
                 }
               }
             }
-            y.data[idx_nhwc(n, ho, wo, kout_base + ko, shape.ho, shape.wo, w.k)] = acc;
+            y.data[idx_nhwc(n, ho, wo, kout_base + ko, shape.ho, shape.wo, w.k)] =
+                static_cast<QuantizedAccumStorage>(acc);
           }
         }
       }
@@ -124,7 +128,7 @@ void cpu_block_fprop_nhwc_qi32_impl(const TensorNHWC& x, const BlockFilterKByBxR
                                     nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp) {
   const BlockConvShape shape = infer_block_conv_shape(x, w, p);
   y = TensorNHWCI32(x.n, shape.base.ho, shape.base.wo, w.k);
-  std::fill(y.data.begin(), y.data.end(), 0);
+  std::fill(y.data.begin(), y.data.end(), 0.0f);
   populate_output_qparams(x.n, in_qp, f_qp, out_qp);
 
   for (int n = 0; n < x.n; ++n) {
@@ -155,7 +159,8 @@ void cpu_block_fprop_nhwc_qi32_impl(const TensorNHWC& x, const BlockFilterKByBxR
                 }
               }
             }
-            y.data[idx_nhwc(n, ho, wo, kout_base + ko, shape.base.ho, shape.base.wo, w.k)] = acc;
+            y.data[idx_nhwc(n, ho, wo, kout_base + ko, shape.base.ho, shape.base.wo, w.k)] =
+                static_cast<QuantizedAccumStorage>(acc);
           }
         }
       }

@@ -152,6 +152,94 @@ void run_regular_case() {
   expect_close(updated_dx_ref.data, copy_from_device(d_dx.ptr, updated_dx_ref.elements()), 1e-4f, 1e-3f, "regular bprop after step");
 }
 
+void run_regular_ayax_case() {
+  const int n = 2;
+  const int h = 7;
+  const int w = 6;
+  const int c = 4;
+
+  Conv2DParams p;
+  p.pad_h = 1;
+  p.pad_w = 0;
+  p.stride_h = 1;
+  p.stride_w = 2;
+  p.dilation_h = 1;
+  p.dilation_w = 1;
+  p.groups = 1;
+  p.ay = 2;
+  p.ax = 3;
+
+  TensorNHWC x(n, h, w, c);
+  FilterKRSC weights(3, 2, c, 5, p.ay, p.ax);
+  fill_pattern(x.data, 23);
+  fill_pattern(weights.data, 509);
+
+  const ConvShape sh = infer_conv_shape(x, weights, p);
+  TensorNHWC dy(n, sh.ho, sh.wo, weights.k);
+  fill_pattern(dy.data, 601);
+
+  TensorNHWC y_ref;
+  TensorNHWC dx_ref(n, h, w, c);
+  FilterKRSC dw_ref(weights.r, weights.s, weights.cin_per_group, weights.k, weights.ay, weights.ax);
+  cpu_fprop_nhwc(x, weights, p, y_ref);
+  cpu_bprop_nhwc(dy, weights, p, dx_ref);
+  cpu_grad_nhwc(x, dy, p, dw_ref);
+
+  Conv2DLayer layer(n, h, w, c, weights, p);
+  if (!layer.regular_config() || layer.blocked_config()) {
+    throw std::runtime_error("regular ay/ax layer config exposure is invalid");
+  }
+  if (layer.regular_config()->shape.ho != y_ref.h ||
+      layer.regular_config()->shape.wo != y_ref.w ||
+      layer.regular_config()->shape.ay != p.ay ||
+      layer.regular_config()->shape.ax != p.ax ||
+      layer.regular_config()->output_elements != y_ref.elements()) {
+    throw std::runtime_error("regular ay/ax runtime config mismatch");
+  }
+
+  DeviceBuffer<float> d_x;
+  DeviceBuffer<float> d_dy;
+  DeviceBuffer<float> d_y;
+  DeviceBuffer<float> d_dx;
+  d_x.allocate(x.elements());
+  d_dy.allocate(dy.elements());
+  d_y.allocate(y_ref.elements());
+  d_dx.allocate(x.elements());
+
+  CUDA_CHECK(cudaMemcpy(d_x.ptr, x.ptr(), x.elements() * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_dy.ptr, dy.ptr(), dy.elements() * sizeof(float), cudaMemcpyHostToDevice));
+
+  layer.forward(d_x.ptr, d_y.ptr);
+  expect_close(y_ref.data, copy_from_device(d_y.ptr, y_ref.elements()), 1e-4f, 1e-3f, "regular ay/ax fprop");
+
+  layer.backward(d_x.ptr, d_dy.ptr, d_dx.ptr);
+  expect_close(dx_ref.data, copy_from_device(d_dx.ptr, dx_ref.elements()), 1e-4f, 1e-3f, "regular ay/ax bprop");
+
+  FilterKRSC dw_gpu;
+  layer.copy_grad_to(dw_gpu);
+  expect_close(dw_ref.data, dw_gpu.data, 1e-4f, 1e-3f, "regular ay/ax grad");
+
+  const float lr = 0.04f;
+  FilterKRSC updated_weights = weights;
+  apply_sgd(updated_weights, dw_ref, lr);
+
+  layer.step(lr);
+  FilterKRSC updated_gpu_weights;
+  layer.copy_weights_to(updated_gpu_weights);
+  expect_close(updated_weights.data, updated_gpu_weights.data, 1e-6f, 1e-6f, "regular ay/ax step");
+
+  TensorNHWC updated_y_ref;
+  TensorNHWC updated_dx_ref(n, h, w, c);
+  cpu_fprop_nhwc(x, updated_weights, p, updated_y_ref);
+  cpu_bprop_nhwc(dy, updated_weights, p, updated_dx_ref);
+
+  layer.forward(d_x.ptr, d_y.ptr);
+  expect_close(updated_y_ref.data, copy_from_device(d_y.ptr, updated_y_ref.elements()), 1e-4f, 1e-3f, "regular ay/ax fprop after step");
+
+  layer.backward_input(d_dy.ptr, d_dx.ptr);
+  expect_close(updated_dx_ref.data, copy_from_device(d_dx.ptr, updated_dx_ref.elements()), 1e-4f, 1e-3f, "regular ay/ax bprop after step");
+}
+
 void run_blocked_case() {
   const int n = 2;
   const int h = 8;
@@ -243,13 +331,106 @@ void run_blocked_case() {
   expect_close(updated_dx_ref.data, copy_from_device(d_dx.ptr, updated_dx_ref.elements()), 1e-4f, 1e-3f, "blocked bprop after step");
 }
 
+void run_blocked_ayax_case() {
+  const int n = 2;
+  const int h = 6;
+  const int w = 6;
+  const int c = 3;
+
+  BlockConv2DParams p;
+  p.conv.pad_h = 1;
+  p.conv.pad_w = 1;
+  p.conv.stride_h = 1;
+  p.conv.stride_w = 1;
+  p.conv.dilation_h = 1;
+  p.conv.dilation_w = 1;
+  p.conv.groups = 1;
+  p.conv.ay = 2;
+  p.conv.ax = 2;
+  p.block_by = 2;
+  p.block_bx = 3;
+
+  TensorNHWC x(n, h, w, c);
+  BlockFilterKByBxRSC weights(4, p.block_by, p.block_bx, 3, 3, c, p.conv.ay, p.conv.ax);
+  fill_pattern(x.data, 71);
+  fill_pattern(weights.data, 907);
+
+  const BlockConvShape sh = infer_block_conv_shape(x, weights, p);
+  TensorNHWC dy(n, sh.base.ho, sh.base.wo, weights.k);
+  fill_pattern(dy.data, 1013);
+
+  TensorNHWC y_ref;
+  TensorNHWC dx_ref(n, h, w, c);
+  BlockFilterKByBxRSC dw_ref(weights.k, weights.by, weights.bx, weights.r, weights.s,
+                             weights.cin_per_group, weights.ay, weights.ax);
+  cpu_block_fprop_nhwc(x, weights, p, y_ref);
+  cpu_block_bprop_nhwc(dy, weights, p, dx_ref);
+  cpu_block_grad_nhwc(x, dy, p, dw_ref);
+
+  Conv2DLayer layer(n, h, w, c, weights, p);
+  if (!layer.blocked_config() || layer.regular_config()) {
+    throw std::runtime_error("blocked ay/ax layer config exposure is invalid");
+  }
+  if (layer.blocked_config()->shape.base.ho != y_ref.h ||
+      layer.blocked_config()->shape.base.wo != y_ref.w ||
+      layer.blocked_config()->shape.base.ay != p.conv.ay ||
+      layer.blocked_config()->shape.base.ax != p.conv.ax ||
+      layer.blocked_config()->output_elements != y_ref.elements()) {
+    throw std::runtime_error("blocked ay/ax runtime config mismatch");
+  }
+
+  DeviceBuffer<float> d_x;
+  DeviceBuffer<float> d_dy;
+  DeviceBuffer<float> d_y;
+  DeviceBuffer<float> d_dx;
+  d_x.allocate(x.elements());
+  d_dy.allocate(dy.elements());
+  d_y.allocate(y_ref.elements());
+  d_dx.allocate(x.elements());
+
+  CUDA_CHECK(cudaMemcpy(d_x.ptr, x.ptr(), x.elements() * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_dy.ptr, dy.ptr(), dy.elements() * sizeof(float), cudaMemcpyHostToDevice));
+
+  layer.forward(d_x.ptr, d_y.ptr);
+  expect_close(y_ref.data, copy_from_device(d_y.ptr, y_ref.elements()), 1e-4f, 1e-3f, "blocked ay/ax fprop");
+
+  layer.backward(d_x.ptr, d_dy.ptr, d_dx.ptr);
+  expect_close(dx_ref.data, copy_from_device(d_dx.ptr, dx_ref.elements()), 1e-4f, 1e-3f, "blocked ay/ax bprop");
+
+  BlockFilterKByBxRSC dw_gpu;
+  layer.copy_grad_to(dw_gpu);
+  expect_close(dw_ref.data, dw_gpu.data, 1e-4f, 1e-3f, "blocked ay/ax grad");
+
+  const float lr = 0.025f;
+  BlockFilterKByBxRSC updated_weights = weights;
+  apply_sgd(updated_weights, dw_ref, lr);
+
+  layer.step(lr);
+  BlockFilterKByBxRSC updated_gpu_weights;
+  layer.copy_weights_to(updated_gpu_weights);
+  expect_close(updated_weights.data, updated_gpu_weights.data, 1e-6f, 1e-6f, "blocked ay/ax step");
+
+  TensorNHWC updated_y_ref;
+  TensorNHWC updated_dx_ref(n, h, w, c);
+  cpu_block_fprop_nhwc(x, updated_weights, p, updated_y_ref);
+  cpu_block_bprop_nhwc(dy, updated_weights, p, updated_dx_ref);
+
+  layer.forward(d_x.ptr, d_y.ptr);
+  expect_close(updated_y_ref.data, copy_from_device(d_y.ptr, updated_y_ref.elements()), 1e-4f, 1e-3f, "blocked ay/ax fprop after step");
+
+  layer.backward_input(d_dy.ptr, d_dx.ptr);
+  expect_close(updated_dx_ref.data, copy_from_device(d_dx.ptr, updated_dx_ref.elements()), 1e-4f, 1e-3f, "blocked ay/ax bprop after step");
+}
+
 }  // namespace
 
 int main() {
   try {
     invalidate_all_conv_workspace_caches();
     run_regular_case();
+    run_regular_ayax_case();
     run_blocked_case();
+    run_blocked_ayax_case();
     std::cout << "conv_layer_test passed\n";
     return 0;
   } catch (const std::exception& e) {

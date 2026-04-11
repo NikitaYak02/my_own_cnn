@@ -3212,11 +3212,11 @@ void launch_block_bias_grad_nhwc(const float* d_dy, float* d_db,
 namespace {
 
 struct QuantizedWorkspace {
-  int32_t* d_col = nullptr;
+  QuantizedAccumStorage* d_col = nullptr;
   size_t d_col_cap = 0;
-  int32_t* d_wg = nullptr;
+  QuantizedAccumStorage* d_wg = nullptr;
   size_t d_wg_cap = 0;
-  int32_t* d_ymat = nullptr;
+  QuantizedAccumStorage* d_ymat = nullptr;
   size_t d_ymat_cap = 0;
 
   ~QuantizedWorkspace() {
@@ -3226,16 +3226,9 @@ struct QuantizedWorkspace {
   }
 };
 
-void ensure_capacity(int32_t** ptr, size_t* cap, size_t elements) {
-  if (*cap >= elements) return;
-  if (*ptr) CUDA_CHECK(cudaFree(*ptr));
-  CUDA_CHECK(cudaMalloc(ptr, elements * sizeof(int32_t)));
-  *cap = elements;
-}
-
 template <nnalgebra::DataType Tin>
 __global__ void im2col_nhwc_qi32_kernel(const float* __restrict__ x,
-                                        int32_t* __restrict__ col,
+                                        QuantizedAccumStorage* __restrict__ col,
                                         int n, int h, int w, int c,
                                         int ho, int wo,
                                         int r, int s,
@@ -3267,15 +3260,15 @@ __global__ void im2col_nhwc_qi32_kernel(const float* __restrict__ x,
   const int wi = wo_idx * stride_w - pad_w + ss * dilation_w;
   if (hi >= 0 && hi < h && wi >= 0 && wi < w) {
     const int32_t raw = static_cast<int32_t>(x[idx_nhwc(n_idx, hi, wi, c_base + ci, h, w, c)]);
-    col[idx] = raw - nnalgebra::getZeroPoint(in_qp[n_idx]);
+    col[idx] = static_cast<QuantizedAccumStorage>(raw - nnalgebra::getZeroPoint(in_qp[n_idx]));
   } else {
-    col[idx] = 0;
+    col[idx] = 0.0f;
   }
 }
 
 template <nnalgebra::DataType Tin>
 __global__ void im2col_nhwc_block_qi32_kernel(const float* __restrict__ x,
-                                              int32_t* __restrict__ col,
+                                              QuantizedAccumStorage* __restrict__ col,
                                               int n, int h, int w, int c,
                                               int ho_start, int wo_start,
                                               int block_ho, int block_wo,
@@ -3310,15 +3303,15 @@ __global__ void im2col_nhwc_block_qi32_kernel(const float* __restrict__ x,
   const int wi = wo * stride_w - pad_w + ss * dilation_w;
   if (hi >= 0 && hi < h && wi >= 0 && wi < w) {
     const int32_t raw = static_cast<int32_t>(x[idx_nhwc(n_idx, hi, wi, c_base + ci, h, w, c)]);
-    col[idx] = raw - nnalgebra::getZeroPoint(in_qp[n_idx]);
+    col[idx] = static_cast<QuantizedAccumStorage>(raw - nnalgebra::getZeroPoint(in_qp[n_idx]));
   } else {
-    col[idx] = 0;
+    col[idx] = 0.0f;
   }
 }
 
 template <nnalgebra::DataType Tin>
 __global__ void pack_filter_krsc_group_qi32_kernel(const float* __restrict__ w,
-                                                   int32_t* __restrict__ wg,
+                                                   QuantizedAccumStorage* __restrict__ wg,
                                                    int r, int s, int cin_group,
                                                    int ay, int ax,
                                                    int k_base, int kout_group,
@@ -3346,7 +3339,7 @@ __global__ void pack_filter_krsc_group_qi32_kernel(const float* __restrict__ w,
 
 template <nnalgebra::DataType Tin>
 __global__ void pack_block_filter_kbybxrsc_group_qi32_kernel(const float* __restrict__ w,
-                                                             int32_t* __restrict__ wg,
+                                                             QuantizedAccumStorage* __restrict__ wg,
                                                              int by_count, int bx_count,
                                                              int r, int s, int cin_group,
                                                              int ay, int ax,
@@ -3385,8 +3378,8 @@ __global__ void update_output_qparams_kernel(
   out_qp[idx].scale = nnalgebra::getScale(in_qp[idx]) * nnalgebra::getScale(*f_qp);
 }
 
-__global__ void unpack_matrix_to_nhwc_group_i32_kernel(const int32_t* __restrict__ src,
-                                                       int32_t* __restrict__ dst,
+__global__ void unpack_matrix_to_nhwc_group_i32_kernel(const QuantizedAccumStorage* __restrict__ src,
+                                                       QuantizedAccumStorage* __restrict__ dst,
                                                        int n, int h, int w, int c,
                                                        int c_base, int c_count) {
   const int m = n * h * w;
@@ -3536,8 +3529,8 @@ __global__ void unpack_matrix_to_nhwc_group_app_block_rows_kernel(const float* _
                c_base + ko, base_h * ay, base_w * ax, c)] = src[idx];
 }
 
-__global__ void unpack_matrix_to_nhwc_group_block_i32_kernel(const int32_t* __restrict__ src,
-                                                             int32_t* __restrict__ dst,
+__global__ void unpack_matrix_to_nhwc_group_block_i32_kernel(const QuantizedAccumStorage* __restrict__ src,
+                                                             QuantizedAccumStorage* __restrict__ dst,
                                                              int n, int h, int w, int c,
                                                              int ho_start, int wo_start,
                                                              int block_ho, int block_wo,
@@ -3559,7 +3552,7 @@ __global__ void unpack_matrix_to_nhwc_group_block_i32_kernel(const int32_t* __re
 }
 
 template <nnalgebra::DataType Tin>
-void launch_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, int32_t* d_y,
+void launch_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, QuantizedAccumStorage* d_y,
                                  int n, int h, int w, int c, int r, int s, int k,
                                  const Conv2DParams& p,
                                  const nnalgebra::QuantizationParameters<Tin>* in_qp,
@@ -3579,7 +3572,7 @@ void launch_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, int32_t* d_
   ensure_capacity(&ws.d_wg, &ws.d_wg_cap, static_cast<size_t>(kdim) * ncol);
   ensure_capacity(&ws.d_ymat, &ws.d_ymat_cap, static_cast<size_t>(m) * ncol);
 
-  CUDA_CHECK(cudaMemset(d_y, 0, static_cast<size_t>(n) * sh.ho * sh.wo * k * sizeof(int32_t)));
+  CUDA_CHECK(cudaMemset(d_y, 0, static_cast<size_t>(n) * sh.ho * sh.wo * k * sizeof(QuantizedAccumStorage)));
 
   for (int g = 0; g < p.groups; ++g) {
     const int cin_base = g * sh.cin_group;
@@ -3626,7 +3619,7 @@ void launch_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, int32_t* d_
 }
 
 template <nnalgebra::DataType Tin>
-void launch_block_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, int32_t* d_y,
+void launch_block_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, QuantizedAccumStorage* d_y,
                                        int n, int h, int w, int c, int r, int s, int k,
                                        const BlockConv2DParams& p,
                                        const nnalgebra::QuantizationParameters<Tin>* in_qp,
@@ -3646,15 +3639,15 @@ void launch_block_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, int32
   ensure_capacity(&ws.d_wg, &ws.d_wg_cap, static_cast<size_t>(kdim) * ncol);
   ensure_capacity(&ws.d_ymat, &ws.d_ymat_cap, static_cast<size_t>(m_block) * ncol);
 
-  CUDA_CHECK(cudaMemset(d_y, 0, static_cast<size_t>(n) * sh.base.ho * sh.base.wo * k * sizeof(int32_t)));
+  CUDA_CHECK(cudaMemset(d_y, 0, static_cast<size_t>(n) * sh.base.ho * sh.base.wo * k * sizeof(QuantizedAccumStorage)));
 
   for (int g = 0; g < p.conv.groups; ++g) {
     const int cin_base = g * sh.base.cin_group;
     const int kout_base = g * sh.base.kout_group;
     for (int by = 0; by < p.block_by; ++by) {
-      const int ho_start = by * sh.block_ho;
+      const int ho_start_base = by * sh.block_ho;
       for (int bx = 0; bx < p.block_bx; ++bx) {
-        const int wo_start = bx * sh.block_wo;
+        const int wo_start_base = bx * sh.block_wo;
 
         const int total_col = m_block * kdim;
         const int blocks_col = (total_col + t - 1) / t;
@@ -3708,7 +3701,7 @@ void launch_block_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, int32
 
 namespace conv_quant_detail {
 
-void launch_fprop_nhwc_qi32_u8(const float* d_x, const float* d_w, int32_t* d_y,
+void launch_fprop_nhwc_qi32_u8(const float* d_x, const float* d_w, QuantizedAccumStorage* d_y,
                                int n, int h, int w, int c, int r, int s, int k,
                                const Conv2DParams& p,
                                const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* in_qp,
@@ -3717,7 +3710,7 @@ void launch_fprop_nhwc_qi32_u8(const float* d_x, const float* d_w, int32_t* d_y,
   launch_fprop_nhwc_qi32_impl(d_x, d_w, d_y, n, h, w, c, r, s, k, p, in_qp, f_qp, out_qp);
 }
 
-void launch_fprop_nhwc_qi32_s5(const float* d_x, const float* d_w, int32_t* d_y,
+void launch_fprop_nhwc_qi32_s5(const float* d_x, const float* d_w, QuantizedAccumStorage* d_y,
                                int n, int h, int w, int c, int r, int s, int k,
                                const Conv2DParams& p,
                                const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* in_qp,
@@ -3726,7 +3719,7 @@ void launch_fprop_nhwc_qi32_s5(const float* d_x, const float* d_w, int32_t* d_y,
   launch_fprop_nhwc_qi32_impl(d_x, d_w, d_y, n, h, w, c, r, s, k, p, in_qp, f_qp, out_qp);
 }
 
-void launch_block_fprop_nhwc_qi32_u8(const float* d_x, const float* d_w, int32_t* d_y,
+void launch_block_fprop_nhwc_qi32_u8(const float* d_x, const float* d_w, QuantizedAccumStorage* d_y,
                                      int n, int h, int w, int c, int r, int s, int k,
                                      const BlockConv2DParams& p,
                                      const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantU8>* in_qp,
@@ -3735,7 +3728,7 @@ void launch_block_fprop_nhwc_qi32_u8(const float* d_x, const float* d_w, int32_t
   launch_block_fprop_nhwc_qi32_impl(d_x, d_w, d_y, n, h, w, c, r, s, k, p, in_qp, f_qp, out_qp);
 }
 
-void launch_block_fprop_nhwc_qi32_s5(const float* d_x, const float* d_w, int32_t* d_y,
+void launch_block_fprop_nhwc_qi32_s5(const float* d_x, const float* d_w, QuantizedAccumStorage* d_y,
                                      int n, int h, int w, int c, int r, int s, int k,
                                      const BlockConv2DParams& p,
                                      const nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantS5>* in_qp,
