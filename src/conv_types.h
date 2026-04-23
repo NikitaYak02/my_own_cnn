@@ -137,9 +137,9 @@ constexpr int kGradSplitKTargetRowsPerChunk = 2048;
 constexpr int kGradSplitKMaxChunks = 16;
 constexpr size_t kGradSplitKMaxPartialElements = 8ull * 1024ull * 1024ull;
 constexpr size_t kGradGemmTileTargetBytes = 64ull * 1024ull * 1024ull;
-constexpr int kGradGemmMinRowsPerChunk = 2048;
-constexpr size_t kConvScratchTargetBytes = 96ull * 1024ull * 1024ull;
-constexpr int kConvMinRowsPerChunk = 1024;
+constexpr int kGradGemmMinRowsPerChunk = 1024;
+constexpr size_t kConvScratchTargetBytes = 48ull * 1024ull * 1024ull;
+constexpr int kConvMinRowsPerChunk = 512;
 
 inline int ceil_div(int x, int y) {
   return (x + y - 1) / y;
@@ -308,6 +308,12 @@ inline Conv2DRuntimeConfig make_conv2d_runtime_config(int n, int h, int w, int c
   cfg.ncol = cfg.shape.kout_group * params.ay * params.ax;
   cfg.conv_rows_per_chunk = conv_runtime_detail::select_conv_rows_per_chunk(cfg.m, cfg.kdim, cfg.ncol);
   cfg.grad_gemm_rows_per_chunk = conv_runtime_detail::select_grad_gemm_rows_per_chunk(cfg.m, cfg.kdim, cfg.ncol);
+  // Depthwise-like/grouped kernels (very small per-group K/N) benefit from
+  // larger row chunks to reduce launch/packing overhead.
+  if (params.groups >= 32 && cfg.ncol <= 4 && cfg.kdim <= 27) {
+    cfg.conv_rows_per_chunk = std::max(cfg.conv_rows_per_chunk, 2048);
+    cfg.grad_gemm_rows_per_chunk = std::max(cfg.grad_gemm_rows_per_chunk, 2048);
+  }
   cfg.grad_slice_weights = cfg.kdim * cfg.ncol;
   cfg.grad_packed_weights =
       weights.r * weights.s * cfg.shape.cin_group *
@@ -343,6 +349,10 @@ inline BlockConv2DRuntimeConfig make_block_conv2d_runtime_config(int n, int h, i
   cfg.ncol = cfg.shape.base.kout_group * params.conv.ay * params.conv.ax;
   cfg.conv_rows_per_chunk = conv_runtime_detail::select_conv_rows_per_chunk(cfg.m_block, cfg.kdim, cfg.ncol);
   cfg.grad_gemm_rows_per_chunk = conv_runtime_detail::select_grad_gemm_rows_per_chunk(cfg.m_block, cfg.kdim, cfg.ncol);
+  if (params.conv.groups >= 32 && cfg.ncol <= 4 && cfg.kdim <= 27) {
+    cfg.conv_rows_per_chunk = std::max(cfg.conv_rows_per_chunk, 2048);
+    cfg.grad_gemm_rows_per_chunk = std::max(cfg.grad_gemm_rows_per_chunk, 2048);
+  }
   cfg.grad_slice_weights = cfg.kdim * cfg.ncol;
   cfg.grad_packed_weights =
       weights.r * weights.s * cfg.shape.base.cin_group *
@@ -526,6 +536,50 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
 void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                             const BlockConv2DRuntimeConfig& cfg,
                             GradKernelAlgo algo = GradKernelAlgo::GemmIm2Col);
+
+// Add bias to convolution outputs laid out as NHWC.
+// If share_app_bias is true, bias is laid out as [k].
+// Otherwise bias is laid out as [k, ay, ax].
+void launch_add_bias_nhwc(float* d_y, const float* d_bias,
+                          int n, int ho, int wo, int k,
+                          int ay = 1, int ax = 1,
+                          bool share_app_bias = true);
+
+// Add bias for blocked outputs.
+// Bias is always block-specific:
+// - share_app_bias=true:  [k, block_by, block_bx]
+// - share_app_bias=false: [k, block_by, block_bx, ay, ax]
+void launch_add_block_bias_nhwc(float* d_y, const float* d_bias,
+                                int n, int ho, int wo, int k,
+                                int ay, int ax,
+                                int block_by, int block_bx,
+                                bool share_app_bias = true);
+
+// Quantized/int32 output bias add variants.
+void launch_add_bias_nhwc_i32(int32_t* d_y, const int32_t* d_bias,
+                              int n, int ho, int wo, int k,
+                              int ay = 1, int ax = 1,
+                              bool share_app_bias = true);
+void launch_add_block_bias_nhwc_i32(int32_t* d_y, const int32_t* d_bias,
+                                    int n, int ho, int wo, int k,
+                                    int ay, int ax,
+                                    int block_by, int block_bx,
+                                    bool share_app_bias = true);
+
+// Bias-gradient reduction from dY (float).
+// share_app_bias=true:
+//   db shape [k] (or [k, block_by, block_bx] for blocked)
+// share_app_bias=false:
+//   db shape [k, ay, ax] (or [k, block_by, block_bx, ay, ax] for blocked)
+void launch_bias_grad_nhwc(const float* d_dy, float* d_db,
+                           int n, int ho, int wo, int k,
+                           int ay = 1, int ax = 1,
+                           bool share_app_bias = true);
+void launch_block_bias_grad_nhwc(const float* d_dy, float* d_db,
+                                 int n, int ho, int wo, int k,
+                                 int ay, int ax,
+                                 int block_by, int block_bx,
+                                 bool share_app_bias = true);
 
 void invalidate_conv_weight_cache(const float* d_w);
 void invalidate_block_conv_weight_cache(const float* d_w);

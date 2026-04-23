@@ -193,9 +193,11 @@ void run_regular_case(const std::string& label) {
   p.dilation_h = 1;
   p.dilation_w = 1;
   p.groups = 2;
+  p.ay = 2;
+  p.ax = 2;
 
   TensorNHWC x(2, 5, 6, 4);
-  FilterKRSC w(3, 2, x.c / p.groups, 6);
+  FilterKRSC w(3, 2, x.c / p.groups, 6, p.ay, p.ax);
   fill_quantized<Tin>(x.data, 1);
   fill_quantized<Tin>(w.data, 7);
 
@@ -315,11 +317,13 @@ void run_blocked_case(const std::string& label) {
   p.conv.dilation_h = 1;
   p.conv.dilation_w = 1;
   p.conv.groups = 1;
+  p.conv.ay = 2;
+  p.conv.ax = 2;
   p.block_by = 2;
   p.block_bx = 3;
 
   TensorNHWC x(2, 6, 6, 4);
-  BlockFilterKByBxRSC w(5, p.block_by, p.block_bx, 3, 3, x.c / p.conv.groups);
+  BlockFilterKByBxRSC w(5, p.block_by, p.block_bx, 3, 3, x.c / p.conv.groups, p.conv.ay, p.conv.ax);
   fill_quantized<Tin>(x.data, 3);
   fill_quantized<Tin>(w.data, 9);
 

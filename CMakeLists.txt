@@ -8,8 +8,13 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES "75" CACHE STRING "Semicolon-separated CUDA SM targets")
+get_property(CUDA_ARCH_CACHE_SET CACHE CMAKE_CUDA_ARCHITECTURES PROPERTY VALUE SET)
+if(NOT CUDA_ARCH_CACHE_SET)
+  set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING "Semicolon-separated CUDA SM targets or 'native'")
+elseif(CMAKE_CUDA_ARCHITECTURES STREQUAL "52")
+  # CMake may pick a very old default (sm_52) when no explicit arch is provided.
+  # Prefer auto-detecting the local GPU architecture by default.
+  set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING "Semicolon-separated CUDA SM targets or 'native'" FORCE)
 endif()
 
 message(STATUS "Configuring CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")

@@ -3,12 +3,18 @@
 #include "bmm.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cuda_runtime.h>
+#include <functional>
+#include <iostream>
+#include <type_traits>
 
 namespace {
 struct Workspace {
   float* d_col = nullptr;
   size_t d_col_cap = 0;
+  float* d_col2 = nullptr;
+  size_t d_col2_cap = 0;
   float* d_wg_all = nullptr;
   size_t d_wg_all_cap = 0;
   float* d_block_wg_all = nullptr;
@@ -33,24 +39,46 @@ struct Workspace {
   int packed_block_ax = 1;
   float* d_ymat = nullptr;
   size_t d_ymat_cap = 0;
+  float* d_ymat2 = nullptr;
+  size_t d_ymat2_cap = 0;
   float* d_dy_mat = nullptr;
   size_t d_dy_mat_cap = 0;
+  float* d_dy_mat2 = nullptr;
+  size_t d_dy_mat2_cap = 0;
   float* d_dcol = nullptr;
   size_t d_dcol_cap = 0;
+  float* d_dcol2 = nullptr;
+  size_t d_dcol2_cap = 0;
   float* d_dwg = nullptr;
   size_t d_dwg_cap = 0;
   float* d_grad_partials = nullptr;
   size_t d_grad_partials_cap = 0;
 
+  cudaStream_t stream_pack = nullptr;
+  cudaStream_t stream_gemm = nullptr;
+  cudaEvent_t evt_pack_ready[2] = {nullptr, nullptr};
+  cudaEvent_t evt_gemm_done[2] = {nullptr, nullptr};
+  bool async_ready = false;
+
   ~Workspace() {
     cudaFree(d_col);
+    cudaFree(d_col2);
     cudaFree(d_wg_all);
     cudaFree(d_block_wg_all);
     cudaFree(d_ymat);
+    cudaFree(d_ymat2);
     cudaFree(d_dy_mat);
+    cudaFree(d_dy_mat2);
     cudaFree(d_dcol);
+    cudaFree(d_dcol2);
     cudaFree(d_dwg);
     cudaFree(d_grad_partials);
+    if (evt_pack_ready[0]) cudaEventDestroy(evt_pack_ready[0]);
+    if (evt_pack_ready[1]) cudaEventDestroy(evt_pack_ready[1]);
+    if (evt_gemm_done[0]) cudaEventDestroy(evt_gemm_done[0]);
+    if (evt_gemm_done[1]) cudaEventDestroy(evt_gemm_done[1]);
+    if (stream_pack) cudaStreamDestroy(stream_pack);
+    if (stream_gemm) cudaStreamDestroy(stream_gemm);
   }
 };
 
@@ -59,6 +87,70 @@ void ensure_capacity(float** ptr, size_t* cap, size_t elements) {
   if (*ptr) CUDA_CHECK(cudaFree(*ptr));
   CUDA_CHECK(cudaMalloc(ptr, elements * sizeof(float)));
   *cap = elements;
+}
+
+void ensure_async_pipeline(Workspace& ws) {
+  if (ws.async_ready) return;
+  CUDA_CHECK(cudaStreamCreateWithFlags(&ws.stream_pack, cudaStreamNonBlocking));
+  CUDA_CHECK(cudaStreamCreateWithFlags(&ws.stream_gemm, cudaStreamNonBlocking));
+  CUDA_CHECK(cudaEventCreateWithFlags(&ws.evt_pack_ready[0], cudaEventDisableTiming));
+  CUDA_CHECK(cudaEventCreateWithFlags(&ws.evt_pack_ready[1], cudaEventDisableTiming));
+  CUDA_CHECK(cudaEventCreateWithFlags(&ws.evt_gemm_done[0], cudaEventDisableTiming));
+  CUDA_CHECK(cudaEventCreateWithFlags(&ws.evt_gemm_done[1], cudaEventDisableTiming));
+  ws.async_ready = true;
+}
+
+bool should_use_async_pipeline(int rows_total, int rows_per_chunk, int kdim, int ncol) {
+  const char* force_sync = std::getenv("CONV_FORCE_SYNC_PIPELINE");
+  if (force_sync && force_sync[0] != '\0' && force_sync[0] != '0') return false;
+  if (rows_total <= rows_per_chunk) return false;
+  const int chunk_work = rows_per_chunk * (kdim + ncol);
+  if (chunk_work < 1 << 15) return false;
+  return true;
+}
+
+bool can_use_implicit_pointwise_im2col(int r, int s,
+                                       int pad_h, int pad_w,
+                                       int stride_h, int stride_w,
+                                       int dilation_h, int dilation_w) {
+  return (r == 1) && (s == 1) &&
+         (pad_h == 0) && (pad_w == 0) &&
+         (stride_h == 1) && (stride_w == 1) &&
+         (dilation_h == 1) && (dilation_w == 1);
+}
+
+bool implicit_pointwise_enabled() {
+  // Set CONV_DISABLE_IMPLICIT_POINTWISE=1 to force legacy im2col path.
+  const char* disable = std::getenv("CONV_DISABLE_IMPLICIT_POINTWISE");
+  return !(disable && disable[0] != '\0' && disable[0] != '0');
+}
+
+bool should_prefer_deterministic_grad(int rows_total, int kdim, int ncol, int groups) {
+  if (groups >= 16) return true;
+  if (kdim <= 64 && ncol <= 64 && rows_total >= 4096) return true;
+  if (kdim * ncol <= 4096 && rows_total >= 8192) return true;
+  return false;
+}
+
+bool stage_profile_enabled() {
+  const char* enable = std::getenv("CONV_PROFILE_STAGES");
+  return (enable && enable[0] != '\0' && enable[0] != '0');
+}
+
+double measure_cuda_stream_ms(cudaStream_t stream, const std::function<void()>& fn) {
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+  CUDA_CHECK(cudaEventCreate(&start));
+  CUDA_CHECK(cudaEventCreate(&stop));
+  CUDA_CHECK(cudaEventRecord(start, stream));
+  fn();
+  CUDA_CHECK(cudaEventRecord(stop, stream));
+  CUDA_CHECK(cudaEventSynchronize(stop));
+  float ms = 0.0f;
+  CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+  CUDA_CHECK(cudaEventDestroy(start));
+  CUDA_CHECK(cudaEventDestroy(stop));
+  return static_cast<double>(ms);
 }
 
 constexpr int kGradSplitKBlockSize = 256;
@@ -99,6 +191,369 @@ __device__ __forceinline__ void decode_output_app_index(int ext_idx, int ay, int
   const int rem = ext_idx - ko * app;
   ay_idx = rem / ax;
   ax_idx = rem - ay_idx * ax;
+}
+
+__global__ void add_bias_nhwc_kernel(float* __restrict__ y,
+                                     const float* __restrict__ bias,
+                                     int n, int ho, int wo, int k,
+                                     int ay, int ax,
+                                     int share_app_bias) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = n * ho * wo * k;
+  if (idx >= total) return;
+
+  const int ko = idx % k;
+  int bias_idx = ko;
+  if (!share_app_bias) {
+    const int rem = idx / k;
+    const int wo_idx = rem % wo;
+    const int ho_idx = (rem / wo) % ho;
+    const int ay_idx = ho_idx % ay;
+    const int ax_idx = wo_idx % ax;
+    bias_idx = (ko * ay + ay_idx) * ax + ax_idx;
+  }
+  y[idx] += bias[bias_idx];
+}
+
+__global__ void add_block_bias_nhwc_kernel(float* __restrict__ y,
+                                           const float* __restrict__ bias,
+                                           int n, int ho, int wo, int k,
+                                           int ay, int ax,
+                                           int block_by, int block_bx,
+                                           int block_ho, int block_wo,
+                                           int share_app_bias) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = n * ho * wo * k;
+  if (idx >= total) return;
+
+  const int ko = idx % k;
+  const int rem0 = idx / k;
+  const int wo_idx = rem0 % wo;
+  const int ho_idx = (rem0 / wo) % ho;
+
+  const int base_ho = ho_idx / ay;
+  const int base_wo = wo_idx / ax;
+  const int by = base_ho / block_ho;
+  const int bx = base_wo / block_wo;
+
+  int bias_idx = ((ko * block_by) + by) * block_bx + bx;
+  if (!share_app_bias) {
+    const int ay_idx = ho_idx - base_ho * ay;
+    const int ax_idx = wo_idx - base_wo * ax;
+    bias_idx = (((bias_idx * ay) + ay_idx) * ax) + ax_idx;
+  }
+  y[idx] += bias[bias_idx];
+}
+
+__global__ void add_bias_nhwc_i32_kernel(int32_t* __restrict__ y,
+                                         const int32_t* __restrict__ bias,
+                                         int n, int ho, int wo, int k,
+                                         int ay, int ax,
+                                         int share_app_bias) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = n * ho * wo * k;
+  if (idx >= total) return;
+
+  const int ko = idx % k;
+  int bias_idx = ko;
+  if (!share_app_bias) {
+    const int rem = idx / k;
+    const int wo_idx = rem % wo;
+    const int ho_idx = (rem / wo) % ho;
+    const int ay_idx = ho_idx % ay;
+    const int ax_idx = wo_idx % ax;
+    bias_idx = (ko * ay + ay_idx) * ax + ax_idx;
+  }
+  y[idx] += bias[bias_idx];
+}
+
+__global__ void add_block_bias_nhwc_i32_kernel(int32_t* __restrict__ y,
+                                                const int32_t* __restrict__ bias,
+                                                int n, int ho, int wo, int k,
+                                                int ay, int ax,
+                                                int block_by, int block_bx,
+                                                int block_ho, int block_wo,
+                                                int share_app_bias) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = n * ho * wo * k;
+  if (idx >= total) return;
+
+  const int ko = idx % k;
+  const int rem0 = idx / k;
+  const int wo_idx = rem0 % wo;
+  const int ho_idx = (rem0 / wo) % ho;
+
+  const int base_ho = ho_idx / ay;
+  const int base_wo = wo_idx / ax;
+  const int by = base_ho / block_ho;
+  const int bx = base_wo / block_wo;
+
+  int bias_idx = ((ko * block_by) + by) * block_bx + bx;
+  if (!share_app_bias) {
+    const int ay_idx = ho_idx - base_ho * ay;
+    const int ax_idx = wo_idx - base_wo * ax;
+    bias_idx = (((bias_idx * ay) + ay_idx) * ax) + ax_idx;
+  }
+  y[idx] += bias[bias_idx];
+}
+
+__global__ void bias_grad_nhwc_kernel(const float* __restrict__ dy,
+                                      float* __restrict__ db,
+                                      int n, int ho, int wo, int k,
+                                      int ay, int ax,
+                                      int share_app_bias) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = n * ho * wo * k;
+  if (idx >= total) return;
+
+  const int ko = idx % k;
+  int db_idx = ko;
+  if (!share_app_bias) {
+    const int rem = idx / k;
+    const int wo_idx = rem % wo;
+    const int ho_idx = (rem / wo) % ho;
+    const int ay_idx = ho_idx % ay;
+    const int ax_idx = wo_idx % ax;
+    db_idx = (ko * ay + ay_idx) * ax + ax_idx;
+  }
+  atomicAdd(&db[db_idx], dy[idx]);
+}
+
+__global__ void block_bias_grad_nhwc_kernel(const float* __restrict__ dy,
+                                            float* __restrict__ db,
+                                            int n, int ho, int wo, int k,
+                                            int ay, int ax,
+                                            int block_by, int block_bx,
+                                            int block_ho, int block_wo,
+                                            int share_app_bias) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = n * ho * wo * k;
+  if (idx >= total) return;
+
+  const int ko = idx % k;
+  const int rem0 = idx / k;
+  const int wo_idx = rem0 % wo;
+  const int ho_idx = (rem0 / wo) % ho;
+
+  const int base_ho = ho_idx / ay;
+  const int base_wo = wo_idx / ax;
+  const int by = base_ho / block_ho;
+  const int bx = base_wo / block_wo;
+
+  int db_idx = ((ko * block_by) + by) * block_bx + bx;
+  if (!share_app_bias) {
+    const int ay_idx = ho_idx - base_ho * ay;
+    const int ax_idx = wo_idx - base_wo * ax;
+    db_idx = (((db_idx * ay) + ay_idx) * ax) + ax_idx;
+  }
+  atomicAdd(&db[db_idx], dy[idx]);
+}
+
+template <typename TOut, typename QParamT>
+__global__ void im2col_nhwc_rows_typed_kernel(const float* __restrict__ x,
+                                              TOut* __restrict__ col,
+                                              int n, int h, int w, int c,
+                                              int ho, int wo,
+                                              int row_start, int row_count,
+                                              int r, int s,
+                                              int pad_h, int pad_w,
+                                              int stride_h, int stride_w,
+                                              int dilation_h, int dilation_w,
+                                              int c_base, int cin_group,
+                                              const QParamT* in_qp) {
+  const int kdim = r * s * cin_group;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = row_count * kdim;
+  if (idx >= total) return;
+
+  const int local_row = idx / kdim;
+  const int col_idx = idx - local_row * kdim;
+  const int row = row_start + local_row;
+
+  const int ci = col_idx % cin_group;
+  const int t = col_idx / cin_group;
+  const int ss = t % s;
+  const int rr = t / s;
+
+  int n_idx, ho_idx, wo_idx;
+  decode_conv_row(row, ho, wo, n_idx, ho_idx, wo_idx);
+
+  const int hi = ho_idx * stride_h - pad_h + rr * dilation_h;
+  const int wi = wo_idx * stride_w - pad_w + ss * dilation_w;
+  if (hi >= 0 && hi < h && wi >= 0 && wi < w) {
+    if constexpr (std::is_same_v<TOut, int32_t>) {
+      const int32_t raw = static_cast<int32_t>(x[idx_nhwc(n_idx, hi, wi, c_base + ci, h, w, c)]);
+      col[idx] = raw - nnalgebra::getZeroPoint(in_qp[n_idx]);
+    } else {
+      col[idx] = x[idx_nhwc(n_idx, hi, wi, c_base + ci, h, w, c)];
+    }
+  } else {
+    col[idx] = static_cast<TOut>(0);
+  }
+}
+
+template <typename TOut, typename QParamT>
+__global__ void im2col_nhwc_block_rows_typed_kernel(const float* __restrict__ x,
+                                                    TOut* __restrict__ col,
+                                                    int n, int h, int w, int c,
+                                                    int ho_start, int wo_start,
+                                                    int block_ho, int block_wo,
+                                                    int row_start, int row_count,
+                                                    int r, int s,
+                                                    int pad_h, int pad_w,
+                                                    int stride_h, int stride_w,
+                                                    int dilation_h, int dilation_w,
+                                                    int c_base, int cin_group,
+                                                    const QParamT* in_qp) {
+  const int kdim = r * s * cin_group;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = row_count * kdim;
+  if (idx >= total) return;
+
+  const int local_row = idx / kdim;
+  const int col_idx = idx - local_row * kdim;
+  const int row = row_start + local_row;
+
+  const int ci = col_idx % cin_group;
+  const int t = col_idx / cin_group;
+  const int ss = t % s;
+  const int rr = t / s;
+
+  const int n_idx = row / (block_ho * block_wo);
+  const int rem = row - n_idx * (block_ho * block_wo);
+  const int lho = rem / block_wo;
+  const int lwo = rem - lho * block_wo;
+  const int ho = ho_start + lho;
+  const int wo = wo_start + lwo;
+  const int hi = ho * stride_h - pad_h + rr * dilation_h;
+  const int wi = wo * stride_w - pad_w + ss * dilation_w;
+  if (hi >= 0 && hi < h && wi >= 0 && wi < w) {
+    if constexpr (std::is_same_v<TOut, int32_t>) {
+      const int32_t raw = static_cast<int32_t>(x[idx_nhwc(n_idx, hi, wi, c_base + ci, h, w, c)]);
+      col[idx] = raw - nnalgebra::getZeroPoint(in_qp[n_idx]);
+    } else {
+      col[idx] = x[idx_nhwc(n_idx, hi, wi, c_base + ci, h, w, c)];
+    }
+  } else {
+    col[idx] = static_cast<TOut>(0);
+  }
+}
+
+template <typename TOut, typename QParamT>
+__global__ void pack_filter_krsc_group_typed_kernel(const float* __restrict__ w,
+                                                    TOut* __restrict__ wg,
+                                                    int r, int s, int cin_group,
+                                                    int ay, int ax,
+                                                    int k_base, int kout_group,
+                                                    const QParamT* f_qp) {
+  const int kdim = r * s * cin_group;
+  const int ncol = kout_group * ay * ax;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = ncol * kdim;
+  if (idx >= total) return;
+
+  const int col_ext = idx / kdim;
+  const int k_idx = idx - col_ext * kdim;
+  int ko, ay_idx, ax_idx;
+  decode_output_app_index(col_ext, ay, ax, ko, ay_idx, ax_idx);
+
+  const int ci = k_idx % cin_group;
+  const int t = k_idx / cin_group;
+  const int ss = t % s;
+  const int rr = t / s;
+  const float raw = w[idx_krsc(k_base + ko, rr, ss, ci, ay_idx, ax_idx, r, s, cin_group, ay, ax)];
+  if constexpr (std::is_same_v<TOut, int32_t>) {
+    wg[idx] = static_cast<int32_t>(raw) - nnalgebra::getZeroPoint(*f_qp);
+  } else {
+    wg[idx] = raw;
+  }
+}
+
+template <typename TOut, typename QParamT>
+__global__ void pack_block_filter_kbybxrsc_group_typed_kernel(const float* __restrict__ w,
+                                                              TOut* __restrict__ wg,
+                                                              int by_count, int bx_count,
+                                                              int r, int s, int cin_group,
+                                                              int ay, int ax,
+                                                              int block_y, int block_x,
+                                                              int k_base, int kout_group,
+                                                              const QParamT* f_qp) {
+  const int kdim = r * s * cin_group;
+  const int ncol = kout_group * ay * ax;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = ncol * kdim;
+  if (idx >= total) return;
+
+  const int col_ext = idx / kdim;
+  const int k_idx = idx - col_ext * kdim;
+  int ko, ay_idx, ax_idx;
+  decode_output_app_index(col_ext, ay, ax, ko, ay_idx, ax_idx);
+
+  const int ci = k_idx % cin_group;
+  const int t = k_idx / cin_group;
+  const int ss = t % s;
+  const int rr = t / s;
+  const float raw = w[idx_kbybxrsc(k_base + ko, block_y, block_x, rr, ss, ci, ay_idx, ax_idx,
+                                   by_count, bx_count, r, s, cin_group, ay, ax)];
+  if constexpr (std::is_same_v<TOut, int32_t>) {
+    wg[idx] = static_cast<int32_t>(raw) - nnalgebra::getZeroPoint(*f_qp);
+  } else {
+    wg[idx] = raw;
+  }
+}
+
+template <typename T>
+__global__ void unpack_matrix_to_nhwc_group_app_rows_typed_kernel(const T* __restrict__ src,
+                                                                  T* __restrict__ dst,
+                                                                  int n, int base_h, int base_w,
+                                                                  int ay, int ax,
+                                                                  int row_start, int row_count,
+                                                                  int c, int c_base, int c_count) {
+  const int ncol = c_count * ay * ax;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = row_count * ncol;
+  if (idx >= total) return;
+
+  const int local_row = idx / ncol;
+  const int ext_col = idx - local_row * ncol;
+  const int row = row_start + local_row;
+
+  int ko, ay_idx, ax_idx;
+  decode_output_app_index(ext_col, ay, ax, ko, ay_idx, ax_idx);
+  int n_idx, ho_base, wo_base;
+  decode_conv_row(row, base_h, base_w, n_idx, ho_base, wo_base);
+  dst[idx_nhwc(n_idx, ho_base * ay + ay_idx, wo_base * ax + ax_idx,
+               c_base + ko, base_h * ay, base_w * ax, c)] = src[idx];
+}
+
+template <typename T>
+__global__ void unpack_matrix_to_nhwc_group_app_block_rows_typed_kernel(const T* __restrict__ src,
+                                                                        T* __restrict__ dst,
+                                                                        int n, int base_h, int base_w, int c,
+                                                                        int ho_start_base, int wo_start_base,
+                                                                        int block_ho_base, int block_wo_base,
+                                                                        int ay, int ax,
+                                                                        int row_start, int row_count,
+                                                                        int c_base, int c_count) {
+  const int ncol = c_count * ay * ax;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = row_count * ncol;
+  if (idx >= total) return;
+
+  const int local_row = idx / ncol;
+  const int ext_col = idx - local_row * ncol;
+  const int row = row_start + local_row;
+
+  int ko, ay_idx, ax_idx;
+  decode_output_app_index(ext_col, ay, ax, ko, ay_idx, ax_idx);
+  const int n_idx = row / (block_ho_base * block_wo_base);
+  const int rem = row - n_idx * (block_ho_base * block_wo_base);
+  const int lho = rem / block_wo_base;
+  const int lwo = rem - lho * block_wo_base;
+  const int ho_base = ho_start_base + lho;
+  const int wo_base = wo_start_base + lwo;
+  dst[idx_nhwc(n_idx, ho_base * ay + ay_idx, wo_base * ax + ax_idx,
+               c_base + ko, base_h * ay, base_w * ax, c)] = src[idx];
 }
 
 __global__ void pack_filter_krsc_group_kernel(const float* __restrict__ w,
@@ -981,6 +1436,7 @@ __global__ void col2im_accum_nhwc_block_rows_kernel(const float* __restrict__ dc
   }
 }
 
+
 __global__ void gather_input_block_nhwc_kernel(const float* __restrict__ src,
                                                float* __restrict__ dst,
                                                int n, int src_h, int src_w, int c,
@@ -1652,25 +2108,33 @@ void launch_grad_gemm_tiled_group_nhwc(const float* d_x, const float* d_dy, floa
   const int m = cfg.m;
   const int rows_per_chunk = cfg.grad_gemm_rows_per_chunk;
   const bool can_vec4 = cfg.can_vec4;
+  const bool use_async = should_use_async_pipeline(m, rows_per_chunk, kdim, ncol);
 
   Workspace& ws = workspace();
+  if (use_async) ensure_async_pipeline(ws);
   ensure_capacity(&ws.d_col, &ws.d_col_cap, static_cast<size_t>(rows_per_chunk) * kdim);
+  ensure_capacity(&ws.d_col2, &ws.d_col2_cap, static_cast<size_t>(rows_per_chunk) * kdim);
   ensure_capacity(&ws.d_dy_mat, &ws.d_dy_mat_cap, static_cast<size_t>(rows_per_chunk) * ncol);
+  ensure_capacity(&ws.d_dy_mat2, &ws.d_dy_mat2_cap, static_cast<size_t>(rows_per_chunk) * ncol);
   ensure_capacity(&ws.d_dwg, &ws.d_dwg_cap, static_cast<size_t>(kdim) * ncol);
-  float* d_col = ws.d_col;
-  float* d_dy_mat = ws.d_dy_mat;
+  float* d_col_buf[2] = {ws.d_col, ws.d_col2};
+  float* d_dy_mat_buf[2] = {ws.d_dy_mat, ws.d_dy_mat2};
   float* d_dwg = ws.d_dwg;
 
   CUDA_CHECK(cudaMemset(d_dwg, 0, static_cast<size_t>(kdim) * ncol * sizeof(float)));
 
   const int t = 256;
-  for (int row_start = 0; row_start < m; row_start += rows_per_chunk) {
+  for (int row_start = 0, chunk_idx = 0; row_start < m; row_start += rows_per_chunk, ++chunk_idx) {
+    const int buf = use_async ? (chunk_idx & 1) : 0;
     const int row_count = std::min(rows_per_chunk, m - row_start);
+    if (use_async && chunk_idx >= 2) {
+      CUDA_CHECK(cudaStreamWaitEvent(ws.stream_pack, ws.evt_gemm_done[buf], 0));
+    }
 
     if (can_vec4 && (cin_base % 4 == 0)) {
       const int total_vec = row_count * r * s * (cin_group / 4);
       const int blocks_vec = (total_vec + t - 1) / t;
-      im2col_nhwc_vec4_rows_kernel<<<blocks_vec, t>>>(d_x, d_col,
+      im2col_nhwc_vec4_rows_kernel<<<blocks_vec, t, 0, use_async ? ws.stream_pack : nullptr>>>(d_x, d_col_buf[buf],
                                                       n, h, w, c,
                                                       base_ho, base_wo,
                                                       row_start, row_count,
@@ -1682,7 +2146,7 @@ void launch_grad_gemm_tiled_group_nhwc(const float* d_x, const float* d_dy, floa
     } else {
       const int total_col = row_count * kdim;
       const int blocks_col = (total_col + t - 1) / t;
-      im2col_nhwc_rows_kernel<<<blocks_col, t>>>(d_x, d_col,
+      im2col_nhwc_rows_kernel<<<blocks_col, t, 0, use_async ? ws.stream_pack : nullptr>>>(d_x, d_col_buf[buf],
                                                  n, h, w, c,
                                                  base_ho, base_wo,
                                                  row_start, row_count,
@@ -1695,14 +2159,25 @@ void launch_grad_gemm_tiled_group_nhwc(const float* d_x, const float* d_dy, floa
 
     const int total_dy = row_count * ncol;
     const int blocks_dy = (total_dy + t - 1) / t;
-    pack_nhwc_group_matrix_app_rows_kernel<<<blocks_dy, t>>>(d_dy, d_dy_mat,
-                                                             n, base_ho, base_wo, p.ay, p.ax,
-                                                             k, row_start, row_count,
-                                                             kout_base, kout_group);
+    pack_nhwc_group_matrix_app_rows_kernel<<<blocks_dy, t, 0, use_async ? ws.stream_pack : nullptr>>>(d_dy, d_dy_mat_buf[buf],
+                                                                                 n, base_ho, base_wo, p.ay, p.ax,
+                                                                                 k, row_start, row_count,
+                                                                                 kout_base, kout_group);
+    if (use_async) {
+      CUDA_CHECK(cudaEventRecord(ws.evt_pack_ready[buf], ws.stream_pack));
+      CUDA_CHECK(cudaStreamWaitEvent(ws.stream_gemm, ws.evt_pack_ready[buf], 0));
+    }
 
-    bmm_matmul_accum(d_col, d_dy_mat, d_dwg,
+    bmm_matmul_accum(d_col_buf[buf], d_dy_mat_buf[buf], d_dwg,
                      1, kdim, ncol, row_count,
-                     BMM_TRANSPOSE_YES, BMM_TRANSPOSE_NONE);
+                     BMM_TRANSPOSE_YES, BMM_TRANSPOSE_NONE, use_async ? ws.stream_gemm : nullptr);
+    if (use_async) {
+      CUDA_CHECK(cudaEventRecord(ws.evt_gemm_done[buf], ws.stream_gemm));
+    }
+  }
+  if (use_async) {
+    CUDA_CHECK(cudaStreamSynchronize(ws.stream_pack));
+    CUDA_CHECK(cudaStreamSynchronize(ws.stream_gemm));
   }
 
   const int total_wg = kdim * ncol;
@@ -1738,46 +2213,65 @@ void launch_block_grad_gemm_tiled_group_nhwc(const float* d_x, const float* d_dy
   const int ncol = cfg.ncol;
   const int m = cfg.m_block;
   const int rows_per_chunk = cfg.grad_gemm_rows_per_chunk;
+  const bool use_async = should_use_async_pipeline(m, rows_per_chunk, kdim, ncol);
 
   Workspace& ws = workspace();
+  if (use_async) ensure_async_pipeline(ws);
   ensure_capacity(&ws.d_col, &ws.d_col_cap, static_cast<size_t>(rows_per_chunk) * kdim);
+  ensure_capacity(&ws.d_col2, &ws.d_col2_cap, static_cast<size_t>(rows_per_chunk) * kdim);
   ensure_capacity(&ws.d_dy_mat, &ws.d_dy_mat_cap, static_cast<size_t>(rows_per_chunk) * ncol);
+  ensure_capacity(&ws.d_dy_mat2, &ws.d_dy_mat2_cap, static_cast<size_t>(rows_per_chunk) * ncol);
   ensure_capacity(&ws.d_dwg, &ws.d_dwg_cap, static_cast<size_t>(kdim) * ncol);
-  float* d_col = ws.d_col;
-  float* d_dy_mat = ws.d_dy_mat;
+  float* d_col_buf[2] = {ws.d_col, ws.d_col2};
+  float* d_dy_mat_buf[2] = {ws.d_dy_mat, ws.d_dy_mat2};
   float* d_dwg = ws.d_dwg;
 
   CUDA_CHECK(cudaMemset(d_dwg, 0, static_cast<size_t>(kdim) * ncol * sizeof(float)));
 
   const int t = 256;
-  for (int row_start = 0; row_start < m; row_start += rows_per_chunk) {
+  for (int row_start = 0, chunk_idx = 0; row_start < m; row_start += rows_per_chunk, ++chunk_idx) {
+    const int buf = use_async ? (chunk_idx & 1) : 0;
     const int row_count = std::min(rows_per_chunk, m - row_start);
+    if (use_async && chunk_idx >= 2) {
+      CUDA_CHECK(cudaStreamWaitEvent(ws.stream_pack, ws.evt_gemm_done[buf], 0));
+    }
     const int total_col = row_count * kdim;
     const int blocks_col = (total_col + t - 1) / t;
-    im2col_nhwc_block_rows_kernel<<<blocks_col, t>>>(d_x, d_col,
-                                                     n, h, w, c,
-                                                     ho_start_base, wo_start_base,
-                                                     block_ho_base, block_wo_base,
-                                                     row_start, row_count,
-                                                     r, s,
-                                                     p.pad_h, p.pad_w,
-                                                     p.stride_h, p.stride_w,
-                                                     p.dilation_h, p.dilation_w,
-                                                     cin_base, cin_group);
+    im2col_nhwc_block_rows_kernel<<<blocks_col, t, 0, use_async ? ws.stream_pack : nullptr>>>(d_x, d_col_buf[buf],
+                                                                         n, h, w, c,
+                                                                         ho_start_base, wo_start_base,
+                                                                         block_ho_base, block_wo_base,
+                                                                         row_start, row_count,
+                                                                         r, s,
+                                                                         p.pad_h, p.pad_w,
+                                                                         p.stride_h, p.stride_w,
+                                                                         p.dilation_h, p.dilation_w,
+                                                                         cin_base, cin_group);
 
     const int total_dy = row_count * ncol;
     const int blocks_dy = (total_dy + t - 1) / t;
-    pack_nhwc_group_matrix_app_block_rows_kernel<<<blocks_dy, t>>>(d_dy, d_dy_mat,
-                                                                   n, base_ho, base_wo, k,
-                                                                   ho_start_base, wo_start_base,
-                                                                   block_ho_base, block_wo_base,
-                                                                   p.ay, p.ax,
-                                                                   row_start, row_count,
-                                                                   kout_base, kout_group);
+    pack_nhwc_group_matrix_app_block_rows_kernel<<<blocks_dy, t, 0, use_async ? ws.stream_pack : nullptr>>>(d_dy, d_dy_mat_buf[buf],
+                                                                                       n, base_ho, base_wo, k,
+                                                                                       ho_start_base, wo_start_base,
+                                                                                       block_ho_base, block_wo_base,
+                                                                                       p.ay, p.ax,
+                                                                                       row_start, row_count,
+                                                                                       kout_base, kout_group);
+    if (use_async) {
+      CUDA_CHECK(cudaEventRecord(ws.evt_pack_ready[buf], ws.stream_pack));
+      CUDA_CHECK(cudaStreamWaitEvent(ws.stream_gemm, ws.evt_pack_ready[buf], 0));
+    }
 
-    bmm_matmul_accum(d_col, d_dy_mat, d_dwg,
+    bmm_matmul_accum(d_col_buf[buf], d_dy_mat_buf[buf], d_dwg,
                      1, kdim, ncol, row_count,
-                     BMM_TRANSPOSE_YES, BMM_TRANSPOSE_NONE);
+                     BMM_TRANSPOSE_YES, BMM_TRANSPOSE_NONE, use_async ? ws.stream_gemm : nullptr);
+    if (use_async) {
+      CUDA_CHECK(cudaEventRecord(ws.evt_gemm_done[buf], ws.stream_gemm));
+    }
+  }
+  if (use_async) {
+    CUDA_CHECK(cudaStreamSynchronize(ws.stream_pack));
+    CUDA_CHECK(cudaStreamSynchronize(ws.stream_gemm));
   }
 
   const int total_wg = kdim * ncol;
@@ -1865,59 +2359,132 @@ void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
   const int kdim = cfg.kdim;
   const int ncol = cfg.ncol;
   const int rows_per_chunk = cfg.conv_rows_per_chunk;
+  const bool use_async = should_use_async_pipeline(m, rows_per_chunk, kdim, ncol);
   const bool can_vec4 = cfg.can_vec4;
+  const bool use_implicit_pointwise = implicit_pointwise_enabled() && can_use_implicit_pointwise_im2col(
+      r, s, p.pad_h, p.pad_w, p.stride_h, p.stride_w, p.dilation_h, p.dilation_w);
+  const bool profile_stages = stage_profile_enabled();
 
   Workspace& ws = workspace();
+  if (use_async) ensure_async_pipeline(ws);
   ensure_capacity(&ws.d_col, &ws.d_col_cap, static_cast<size_t>(rows_per_chunk) * kdim);
+  ensure_capacity(&ws.d_col2, &ws.d_col2_cap, static_cast<size_t>(rows_per_chunk) * kdim);
   ensure_capacity(&ws.d_ymat, &ws.d_ymat_cap, static_cast<size_t>(rows_per_chunk) * ncol);
+  ensure_capacity(&ws.d_ymat2, &ws.d_ymat2_cap, static_cast<size_t>(rows_per_chunk) * ncol);
   ensure_packed_weights(ws, d_w, r, s, sh.cin_group, k, p.groups, p.ay, p.ax);
-  float* d_col = ws.d_col;
-  float* d_ymat = ws.d_ymat;
+  float* d_col_buf[2] = {ws.d_col, ws.d_col2};
+  float* d_ymat_buf[2] = {ws.d_ymat, ws.d_ymat2};
 
   const int t = 256;
+  double stage_pack_ms = 0.0;
+  double stage_gemm_ms = 0.0;
+  double stage_unpack_ms = 0.0;
   for (int g = 0; g < p.groups; ++g) {
     const int cin_base = g * sh.cin_group;
     const int kout_base = g * sh.kout_group;
     float* d_wg = ws.d_wg_all + static_cast<size_t>(g) * ncol * kdim;
 
-    for (int row_start = 0; row_start < m; row_start += rows_per_chunk) {
+    for (int row_start = 0, chunk_idx = 0; row_start < m; row_start += rows_per_chunk, ++chunk_idx) {
+      const int buf = use_async ? (chunk_idx & 1) : 0;
       const int row_count = std::min(rows_per_chunk, m - row_start);
-      const int total_col = row_count * kdim;
-      const int blocks_col = (total_col + t - 1) / t;
-      if (can_vec4 && (cin_base % 4 == 0)) {
-        const int total_vec = row_count * r * s * (sh.cin_group / 4);
-        const int blocks_vec = (total_vec + t - 1) / t;
-        im2col_nhwc_vec4_rows_kernel<<<blocks_vec, t>>>(d_x, d_col, n, h, w, c,
-                                                        sh.base_ho, sh.base_wo,
-                                                        row_start, row_count,
-                                                        r, s,
-                                                        p.pad_h, p.pad_w,
-                                                        p.stride_h, p.stride_w,
-                                                        p.dilation_h, p.dilation_w,
-                                                        cin_base, sh.cin_group);
+      if (use_async && chunk_idx >= 2) {
+        CUDA_CHECK(cudaStreamWaitEvent(ws.stream_pack, ws.evt_gemm_done[buf], 0));
+      }
+      if (use_implicit_pointwise) {
+        const int total_pack = row_count * sh.cin_group;
+        const int blocks_pack = (total_pack + t - 1) / t;
+        auto launch_pack = [&]() {
+          pack_nhwc_group_matrix_rows_kernel<<<blocks_pack, t, 0, use_async ? ws.stream_pack : nullptr>>>(
+              d_x, d_col_buf[buf], n, h, w, c, row_start, row_count, cin_base, sh.cin_group);
+        };
+        if (profile_stages) {
+          stage_pack_ms += measure_cuda_stream_ms(use_async ? ws.stream_pack : nullptr, launch_pack);
+        } else {
+          launch_pack();
+        }
       } else {
-        im2col_nhwc_rows_kernel<<<blocks_col, t>>>(d_x, d_col, n, h, w, c,
-                                                   sh.base_ho, sh.base_wo,
-                                                   row_start, row_count,
-                                                   r, s,
-                                                   p.pad_h, p.pad_w,
-                                                   p.stride_h, p.stride_w,
-                                                   p.dilation_h, p.dilation_w,
-                                                   cin_base, sh.cin_group);
+        const int total_col = row_count * kdim;
+        const int blocks_col = (total_col + t - 1) / t;
+        if (can_vec4 && (cin_base % 4 == 0)) {
+          const int total_vec = row_count * r * s * (sh.cin_group / 4);
+          const int blocks_vec = (total_vec + t - 1) / t;
+          auto launch_pack = [&]() {
+            im2col_nhwc_vec4_rows_kernel<<<blocks_vec, t, 0, use_async ? ws.stream_pack : nullptr>>>(d_x, d_col_buf[buf], n, h, w, c,
+                                                                                sh.base_ho, sh.base_wo,
+                                                                                row_start, row_count,
+                                                                                r, s,
+                                                                                p.pad_h, p.pad_w,
+                                                                                p.stride_h, p.stride_w,
+                                                                                p.dilation_h, p.dilation_w,
+                                                                                cin_base, sh.cin_group);
+          };
+          if (profile_stages) {
+            stage_pack_ms += measure_cuda_stream_ms(use_async ? ws.stream_pack : nullptr, launch_pack);
+          } else {
+            launch_pack();
+          }
+        } else {
+          auto launch_pack = [&]() {
+            im2col_nhwc_rows_kernel<<<blocks_col, t, 0, use_async ? ws.stream_pack : nullptr>>>(d_x, d_col_buf[buf], n, h, w, c,
+                                                                           sh.base_ho, sh.base_wo,
+                                                                           row_start, row_count,
+                                                                           r, s,
+                                                                           p.pad_h, p.pad_w,
+                                                                           p.stride_h, p.stride_w,
+                                                                           p.dilation_h, p.dilation_w,
+                                                                           cin_base, sh.cin_group);
+          };
+          if (profile_stages) {
+            stage_pack_ms += measure_cuda_stream_ms(use_async ? ws.stream_pack : nullptr, launch_pack);
+          } else {
+            launch_pack();
+          }
+        }
+      }
+      if (use_async) {
+        CUDA_CHECK(cudaEventRecord(ws.evt_pack_ready[buf], ws.stream_pack));
+        CUDA_CHECK(cudaStreamWaitEvent(ws.stream_gemm, ws.evt_pack_ready[buf], 0));
       }
 
       // Forward GEMM: [row_count, kdim] @ [ncol, kdim]^T -> [row_count, ncol]
-      bmm_matmul(d_col, d_wg, d_ymat, 1, row_count, ncol, kdim, BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_YES);
+      auto launch_gemm = [&]() {
+        bmm_matmul(d_col_buf[buf], d_wg, d_ymat_buf[buf], 1, row_count, ncol, kdim,
+                   BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_YES, use_async ? ws.stream_gemm : nullptr);
+      };
+      if (profile_stages) {
+        stage_gemm_ms += measure_cuda_stream_ms(use_async ? ws.stream_gemm : nullptr, launch_gemm);
+      } else {
+        launch_gemm();
+      }
 
       const int total_ym = row_count * ncol;
       const int blocks_ym = (total_ym + t - 1) / t;
-      unpack_matrix_to_nhwc_group_app_rows_kernel<<<blocks_ym, t>>>(d_ymat, d_y,
-                                                                    n, sh.base_ho, sh.base_wo, p.ay, p.ax,
-                                                                    row_start, row_count,
-                                                                    k, kout_base, sh.kout_group);
+      auto launch_unpack = [&]() {
+        unpack_matrix_to_nhwc_group_app_rows_kernel<<<blocks_ym, t, 0, use_async ? ws.stream_gemm : nullptr>>>(d_ymat_buf[buf], d_y,
+                                                                                           n, sh.base_ho, sh.base_wo, p.ay, p.ax,
+                                                                                           row_start, row_count,
+                                                                                           k, kout_base, sh.kout_group);
+      };
+      if (profile_stages) {
+        stage_unpack_ms += measure_cuda_stream_ms(use_async ? ws.stream_gemm : nullptr, launch_unpack);
+      } else {
+        launch_unpack();
+      }
+      if (use_async) {
+        CUDA_CHECK(cudaEventRecord(ws.evt_gemm_done[buf], ws.stream_gemm));
+      }
+    }
+    if (use_async) {
+      CUDA_CHECK(cudaStreamSynchronize(ws.stream_pack));
+      CUDA_CHECK(cudaStreamSynchronize(ws.stream_gemm));
     }
   }
 
+  if (profile_stages) {
+    std::cout << "stage_profile fprop pack_ms=" << stage_pack_ms
+              << " gemm_ms=" << stage_gemm_ms
+              << " unpack_ms=" << stage_unpack_ms << "\n";
+  }
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1943,15 +2510,23 @@ void launch_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
   const int kdim = cfg.kdim;
   const int ncol = cfg.ncol;
   const int rows_per_chunk = cfg.conv_rows_per_chunk;
+  const bool use_async = should_use_async_pipeline(m, rows_per_chunk, kdim, ncol);
 
   Workspace& ws = workspace();
+  if (use_async) ensure_async_pipeline(ws);
   ensure_capacity(&ws.d_dy_mat, &ws.d_dy_mat_cap, static_cast<size_t>(rows_per_chunk) * ncol);
+  ensure_capacity(&ws.d_dy_mat2, &ws.d_dy_mat2_cap, static_cast<size_t>(rows_per_chunk) * ncol);
   ensure_capacity(&ws.d_dcol, &ws.d_dcol_cap, static_cast<size_t>(rows_per_chunk) * kdim);
+  ensure_capacity(&ws.d_dcol2, &ws.d_dcol2_cap, static_cast<size_t>(rows_per_chunk) * kdim);
   ensure_packed_weights(ws, d_w, r, s, sh.cin_group, k, p.groups, p.ay, p.ax);
-  float* d_dy_mat = ws.d_dy_mat;
-  float* d_dcol = ws.d_dcol;
+  float* d_dy_mat_buf[2] = {ws.d_dy_mat, ws.d_dy_mat2};
+  float* d_dcol_buf[2] = {ws.d_dcol, ws.d_dcol2};
 
-  CUDA_CHECK(cudaMemset(d_dx, 0, static_cast<size_t>(n) * h * w * c * sizeof(float)));
+  if (use_async) {
+    CUDA_CHECK(cudaMemsetAsync(d_dx, 0, static_cast<size_t>(n) * h * w * c * sizeof(float), ws.stream_gemm));
+  } else {
+    CUDA_CHECK(cudaMemset(d_dx, 0, static_cast<size_t>(n) * h * w * c * sizeof(float)));
+  }
 
   const int t = 256;
 
@@ -1960,30 +2535,46 @@ void launch_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
     const int kout_base = g * sh.kout_group;
     float* d_wg = ws.d_wg_all + static_cast<size_t>(g) * ncol * kdim;
 
-    for (int row_start = 0; row_start < m; row_start += rows_per_chunk) {
+    for (int row_start = 0, chunk_idx = 0; row_start < m; row_start += rows_per_chunk, ++chunk_idx) {
+      const int buf = use_async ? (chunk_idx & 1) : 0;
       const int row_count = std::min(rows_per_chunk, m - row_start);
+      if (use_async && chunk_idx >= 2) {
+        CUDA_CHECK(cudaStreamWaitEvent(ws.stream_pack, ws.evt_gemm_done[buf], 0));
+      }
       const int total_dy = row_count * ncol;
       const int blocks_dy = (total_dy + t - 1) / t;
-      pack_nhwc_group_matrix_app_rows_kernel<<<blocks_dy, t>>>(d_dy, d_dy_mat,
-                                                               n, sh.base_ho, sh.base_wo, p.ay, p.ax,
-                                                               k,
-                                                               row_start, row_count,
-                                                               kout_base, sh.kout_group);
+      pack_nhwc_group_matrix_app_rows_kernel<<<blocks_dy, t, 0, use_async ? ws.stream_pack : nullptr>>>(d_dy, d_dy_mat_buf[buf],
+                                                                                   n, sh.base_ho, sh.base_wo, p.ay, p.ax,
+                                                                                   k,
+                                                                                   row_start, row_count,
+                                                                                   kout_base, sh.kout_group);
+      if (use_async) {
+        CUDA_CHECK(cudaEventRecord(ws.evt_pack_ready[buf], ws.stream_pack));
+        CUDA_CHECK(cudaStreamWaitEvent(ws.stream_gemm, ws.evt_pack_ready[buf], 0));
+      }
 
       // Input-gradient GEMM: [row_count, ncol] @ [ncol, kdim] -> [row_count, kdim]
-      bmm_matmul(d_dy_mat, d_wg, d_dcol, 1, row_count, kdim, ncol, BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_NONE);
+      bmm_matmul(d_dy_mat_buf[buf], d_wg, d_dcol_buf[buf], 1, row_count, kdim, ncol,
+                 BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_NONE, use_async ? ws.stream_gemm : nullptr);
 
       const int total_dcol = row_count * kdim;
       const int blocks_dcol = (total_dcol + t - 1) / t;
-      col2im_accum_nhwc_rows_kernel<<<blocks_dcol, t>>>(d_dcol, d_dx,
-                                                        n, h, w, c,
-                                                        sh.base_ho, sh.base_wo,
-                                                        row_start, row_count,
-                                                        r, s,
-                                                        p.pad_h, p.pad_w,
-                                                        p.stride_h, p.stride_w,
-                                                        p.dilation_h, p.dilation_w,
-                                                        cin_base, sh.cin_group);
+      col2im_accum_nhwc_rows_kernel<<<blocks_dcol, t, 0, use_async ? ws.stream_gemm : nullptr>>>(d_dcol_buf[buf], d_dx,
+                                                                            n, h, w, c,
+                                                                            sh.base_ho, sh.base_wo,
+                                                                            row_start, row_count,
+                                                                            r, s,
+                                                                            p.pad_h, p.pad_w,
+                                                                            p.stride_h, p.stride_w,
+                                                                            p.dilation_h, p.dilation_w,
+                                                                            cin_base, sh.cin_group);
+      if (use_async) {
+        CUDA_CHECK(cudaEventRecord(ws.evt_gemm_done[buf], ws.stream_gemm));
+      }
+    }
+    if (use_async) {
+      CUDA_CHECK(cudaStreamSynchronize(ws.stream_pack));
+      CUDA_CHECK(cudaStreamSynchronize(ws.stream_gemm));
     }
   }
 
@@ -2013,6 +2604,13 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
 
   if ((p.ay != 1 || p.ax != 1) && algo != GradKernelAlgo::GemmIm2Col) {
     throw std::runtime_error("Ay/Ax currently support only grad_algo=gemm");
+  }
+
+  const bool prefer_deterministic =
+      should_prefer_deterministic_grad(cfg.m, cfg.kdim, cfg.ncol, cfg.params.groups);
+  if ((algo == GradKernelAlgo::Algo0Atomic || algo == GradKernelAlgo::Algo2TiledAtomic) &&
+      prefer_deterministic) {
+    algo = GradKernelAlgo::Algo1Deterministic;
   }
 
   if (algo == GradKernelAlgo::Algo0Atomic) {
@@ -2094,8 +2692,6 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
     return;
   }
 
-  CUDA_CHECK(cudaMemset(d_dw, 0, cfg.weight_elements * sizeof(float)));
-
   for (int g = 0; g < p.groups; ++g) {
     const int cin_base = g * sh.cin_group;
     const int kout_base = g * sh.kout_group;
@@ -2127,14 +2723,23 @@ void launch_block_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
   const int kdim = cfg.kdim;
   const int ncol = cfg.ncol;
   const int rows_per_chunk = cfg.conv_rows_per_chunk;
+  const bool use_async = should_use_async_pipeline(m_block, rows_per_chunk, kdim, ncol);
   const size_t per_group_slice = cfg.per_group_slice;
+  const bool use_implicit_pointwise = implicit_pointwise_enabled() && can_use_implicit_pointwise_im2col(
+      r, s,
+      p.conv.pad_h, p.conv.pad_w,
+      p.conv.stride_h, p.conv.stride_w,
+      p.conv.dilation_h, p.conv.dilation_w);
 
   Workspace& ws = workspace();
+  if (use_async) ensure_async_pipeline(ws);
   ensure_capacity(&ws.d_col, &ws.d_col_cap, static_cast<size_t>(rows_per_chunk) * kdim);
+  ensure_capacity(&ws.d_col2, &ws.d_col2_cap, static_cast<size_t>(rows_per_chunk) * kdim);
   ensure_capacity(&ws.d_ymat, &ws.d_ymat_cap, static_cast<size_t>(rows_per_chunk) * ncol);
+  ensure_capacity(&ws.d_ymat2, &ws.d_ymat2_cap, static_cast<size_t>(rows_per_chunk) * ncol);
   ensure_packed_block_weights(ws, d_w, p.block_by, p.block_bx, r, s, sh.base.cin_group, k, p.conv.groups, p.conv.ay, p.conv.ax);
-  float* d_col = ws.d_col;
-  float* d_ymat = ws.d_ymat;
+  float* d_col_buf[2] = {ws.d_col, ws.d_col2};
+  float* d_ymat_buf[2] = {ws.d_ymat, ws.d_ymat2};
 
   const int t = 256;
   for (int g = 0; g < p.conv.groups; ++g) {
@@ -2146,32 +2751,57 @@ void launch_block_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
         const int wo_start = bx * sh.block_wo;
         float* d_wg = ws.d_block_wg_all + packed_block_weight_offset(p.conv.groups, p.block_by, p.block_bx,
                                                                      g, by, bx, per_group_slice);
-        for (int row_start = 0; row_start < m_block; row_start += rows_per_chunk) {
+        for (int row_start = 0, chunk_idx = 0; row_start < m_block; row_start += rows_per_chunk, ++chunk_idx) {
+          const int buf = use_async ? (chunk_idx & 1) : 0;
           const int row_count = std::min(rows_per_chunk, m_block - row_start);
-          const int total_col = row_count * kdim;
-          const int blocks_col = (total_col + t - 1) / t;
-          im2col_nhwc_block_rows_kernel<<<blocks_col, t>>>(d_x, d_col,
-                                                           n, h, w, c,
-                                                           ho_start, wo_start,
-                                                           sh.block_ho, sh.block_wo,
-                                                           row_start, row_count,
-                                                           r, s,
-                                                           p.conv.pad_h, p.conv.pad_w,
-                                                           p.conv.stride_h, p.conv.stride_w,
-                                                           p.conv.dilation_h, p.conv.dilation_w,
-                                                           cin_base, sh.base.cin_group);
+          if (use_async && chunk_idx >= 2) {
+            CUDA_CHECK(cudaStreamWaitEvent(ws.stream_pack, ws.evt_gemm_done[buf], 0));
+          }
+          if (use_implicit_pointwise) {
+            const int total_pack = row_count * sh.base.cin_group;
+            const int blocks_pack = (total_pack + t - 1) / t;
+            pack_nhwc_group_matrix_block_rows_kernel<<<blocks_pack, t, 0, use_async ? ws.stream_pack : nullptr>>>(
+                d_x, d_col_buf[buf], n, h, w, c,
+                ho_start, wo_start, sh.block_ho, sh.block_wo,
+                row_start, row_count, cin_base, sh.base.cin_group);
+          } else {
+            const int total_col = row_count * kdim;
+            const int blocks_col = (total_col + t - 1) / t;
+            im2col_nhwc_block_rows_kernel<<<blocks_col, t, 0, use_async ? ws.stream_pack : nullptr>>>(d_x, d_col_buf[buf],
+                                                                                                        n, h, w, c,
+                                                                                                        ho_start, wo_start,
+                                                                                                        sh.block_ho, sh.block_wo,
+                                                                                                        row_start, row_count,
+                                                                                                        r, s,
+                                                                                                        p.conv.pad_h, p.conv.pad_w,
+                                                                                                        p.conv.stride_h, p.conv.stride_w,
+                                                                                                        p.conv.dilation_h, p.conv.dilation_w,
+                                                                                                        cin_base, sh.base.cin_group);
+          }
+          if (use_async) {
+            CUDA_CHECK(cudaEventRecord(ws.evt_pack_ready[buf], ws.stream_pack));
+            CUDA_CHECK(cudaStreamWaitEvent(ws.stream_gemm, ws.evt_pack_ready[buf], 0));
+          }
 
-          bmm_matmul(d_col, d_wg, d_ymat, 1, row_count, ncol, kdim, BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_YES);
+          bmm_matmul(d_col_buf[buf], d_wg, d_ymat_buf[buf], 1, row_count, ncol, kdim,
+                     BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_YES, use_async ? ws.stream_gemm : nullptr);
 
           const int total_ym = row_count * ncol;
           const int blocks_ym = (total_ym + t - 1) / t;
-          unpack_matrix_to_nhwc_group_app_block_rows_kernel<<<blocks_ym, t>>>(d_ymat, d_y,
-                                                                              n, sh.base.base_ho, sh.base.base_wo, k,
-                                                                              ho_start, wo_start,
-                                                                              sh.block_ho, sh.block_wo,
-                                                                              p.conv.ay, p.conv.ax,
-                                                                              row_start, row_count,
-                                                                              kout_base, sh.base.kout_group);
+          unpack_matrix_to_nhwc_group_app_block_rows_kernel<<<blocks_ym, t, 0, use_async ? ws.stream_gemm : nullptr>>>(d_ymat_buf[buf], d_y,
+                                                                                                    n, sh.base.base_ho, sh.base.base_wo, k,
+                                                                                                    ho_start, wo_start,
+                                                                                                    sh.block_ho, sh.block_wo,
+                                                                                                    p.conv.ay, p.conv.ax,
+                                                                                                    row_start, row_count,
+                                                                                                    kout_base, sh.base.kout_group);
+          if (use_async) {
+            CUDA_CHECK(cudaEventRecord(ws.evt_gemm_done[buf], ws.stream_gemm));
+          }
+        }
+        if (use_async) {
+          CUDA_CHECK(cudaStreamSynchronize(ws.stream_pack));
+          CUDA_CHECK(cudaStreamSynchronize(ws.stream_gemm));
         }
       }
     }
@@ -2203,13 +2833,17 @@ void launch_block_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
   const int ncol = cfg.ncol;
   const int rows_per_chunk = cfg.conv_rows_per_chunk;
   const size_t per_group_slice = cfg.per_group_slice;
+  const bool use_async = should_use_async_pipeline(m_block, rows_per_chunk, kdim, ncol);
 
   Workspace& ws = workspace();
+  if (use_async) ensure_async_pipeline(ws);
   ensure_capacity(&ws.d_dy_mat, &ws.d_dy_mat_cap, static_cast<size_t>(rows_per_chunk) * ncol);
+  ensure_capacity(&ws.d_dy_mat2, &ws.d_dy_mat2_cap, static_cast<size_t>(rows_per_chunk) * ncol);
   ensure_capacity(&ws.d_dcol, &ws.d_dcol_cap, static_cast<size_t>(rows_per_chunk) * kdim);
+  ensure_capacity(&ws.d_dcol2, &ws.d_dcol2_cap, static_cast<size_t>(rows_per_chunk) * kdim);
   ensure_packed_block_weights(ws, d_w, p.block_by, p.block_bx, r, s, sh.base.cin_group, k, p.conv.groups, p.conv.ay, p.conv.ax);
-  float* d_dy_mat = ws.d_dy_mat;
-  float* d_dcol = ws.d_dcol;
+  float* d_dy_mat_buf[2] = {ws.d_dy_mat, ws.d_dy_mat2};
+  float* d_dcol_buf[2] = {ws.d_dcol, ws.d_dcol2};
 
   CUDA_CHECK(cudaMemset(d_dx, 0, static_cast<size_t>(n) * h * w * c * sizeof(float)));
 
@@ -2223,32 +2857,48 @@ void launch_block_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
         const int wo_start = bx * sh.block_wo;
         float* d_wg = ws.d_block_wg_all + packed_block_weight_offset(p.conv.groups, p.block_by, p.block_bx,
                                                                      g, by, bx, per_group_slice);
-        for (int row_start = 0; row_start < m_block; row_start += rows_per_chunk) {
+        for (int row_start = 0, chunk_idx = 0; row_start < m_block; row_start += rows_per_chunk, ++chunk_idx) {
+          const int buf = use_async ? (chunk_idx & 1) : 0;
           const int row_count = std::min(rows_per_chunk, m_block - row_start);
+          if (use_async && chunk_idx >= 2) {
+            CUDA_CHECK(cudaStreamWaitEvent(ws.stream_pack, ws.evt_gemm_done[buf], 0));
+          }
           const int total_dy = row_count * ncol;
           const int blocks_dy = (total_dy + t - 1) / t;
-          pack_nhwc_group_matrix_app_block_rows_kernel<<<blocks_dy, t>>>(d_dy, d_dy_mat,
-                                                                         n, sh.base.base_ho, sh.base.base_wo, k,
-                                                                         ho_start, wo_start,
-                                                                         sh.block_ho, sh.block_wo,
-                                                                         p.conv.ay, p.conv.ax,
-                                                                         row_start, row_count,
-                                                                         kout_base, sh.base.kout_group);
+          pack_nhwc_group_matrix_app_block_rows_kernel<<<blocks_dy, t, 0, use_async ? ws.stream_pack : nullptr>>>(d_dy, d_dy_mat_buf[buf],
+                                                                                               n, sh.base.base_ho, sh.base.base_wo, k,
+                                                                                               ho_start, wo_start,
+                                                                                               sh.block_ho, sh.block_wo,
+                                                                                               p.conv.ay, p.conv.ax,
+                                                                                               row_start, row_count,
+                                                                                               kout_base, sh.base.kout_group);
+          if (use_async) {
+            CUDA_CHECK(cudaEventRecord(ws.evt_pack_ready[buf], ws.stream_pack));
+            CUDA_CHECK(cudaStreamWaitEvent(ws.stream_gemm, ws.evt_pack_ready[buf], 0));
+          }
 
-          bmm_matmul(d_dy_mat, d_wg, d_dcol, 1, row_count, kdim, ncol, BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_NONE);
+          bmm_matmul(d_dy_mat_buf[buf], d_wg, d_dcol_buf[buf], 1, row_count, kdim, ncol,
+                     BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_NONE, use_async ? ws.stream_gemm : nullptr);
 
           const int total_dcol = row_count * kdim;
           const int blocks_dcol = (total_dcol + t - 1) / t;
-          col2im_accum_nhwc_block_rows_kernel<<<blocks_dcol, t>>>(d_dcol, d_dx,
-                                                                  n, h, w, c,
-                                                                  ho_start, wo_start,
-                                                                  sh.block_ho, sh.block_wo,
-                                                                  row_start, row_count,
-                                                                  r, s,
-                                                                  p.conv.pad_h, p.conv.pad_w,
-                                                                  p.conv.stride_h, p.conv.stride_w,
-                                                                  p.conv.dilation_h, p.conv.dilation_w,
-                                                                  cin_base, sh.base.cin_group);
+          col2im_accum_nhwc_block_rows_kernel<<<blocks_dcol, t, 0, use_async ? ws.stream_gemm : nullptr>>>(d_dcol_buf[buf], d_dx,
+                                                                                                               n, h, w, c,
+                                                                                                               ho_start, wo_start,
+                                                                                                               sh.block_ho, sh.block_wo,
+                                                                                                               row_start, row_count,
+                                                                                                               r, s,
+                                                                                                               p.conv.pad_h, p.conv.pad_w,
+                                                                                                               p.conv.stride_h, p.conv.stride_w,
+                                                                                                               p.conv.dilation_h, p.conv.dilation_w,
+                                                                                                               cin_base, sh.base.cin_group);
+          if (use_async) {
+            CUDA_CHECK(cudaEventRecord(ws.evt_gemm_done[buf], ws.stream_gemm));
+          }
+        }
+        if (use_async) {
+          CUDA_CHECK(cudaStreamSynchronize(ws.stream_pack));
+          CUDA_CHECK(cudaStreamSynchronize(ws.stream_gemm));
         }
       }
     }
@@ -2280,6 +2930,13 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
 
   if ((p.conv.ay != 1 || p.conv.ax != 1) && algo != GradKernelAlgo::GemmIm2Col) {
     throw std::runtime_error("Ay/Ax currently support only grad_algo=gemm");
+  }
+
+  const bool prefer_deterministic =
+      should_prefer_deterministic_grad(cfg.m_block, cfg.kdim, cfg.ncol, cfg.params.conv.groups);
+  if ((algo == GradKernelAlgo::Algo0Atomic || algo == GradKernelAlgo::Algo2TiledAtomic) &&
+      prefer_deterministic) {
+    algo = GradKernelAlgo::Algo1Deterministic;
   }
 
   if (algo == GradKernelAlgo::Algo0Atomic) {
@@ -2384,7 +3041,6 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
     return;
   }
 
-  CUDA_CHECK(cudaMemset(d_dw, 0, cfg.weight_elements * sizeof(float)));
   for (int g = 0; g < p.conv.groups; ++g) {
     const int cin_base = g * sh.base.cin_group;
     const int kout_base = g * sh.base.kout_group;
@@ -2395,6 +3051,161 @@ void launch_block_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
     }
   }
 
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_add_bias_nhwc(float* d_y, const float* d_bias,
+                          int n, int ho, int wo, int k,
+                          int ay, int ax,
+                          bool share_app_bias) {
+  if (!d_y || !d_bias) throw std::runtime_error("launch_add_bias_nhwc received null pointer");
+  if (n <= 0 || ho <= 0 || wo <= 0 || k <= 0) return;
+  if (ay <= 0 || ax <= 0) throw std::runtime_error("launch_add_bias_nhwc expects ay/ax > 0");
+  if ((ho % ay) != 0 || (wo % ax) != 0) {
+    throw std::runtime_error("launch_add_bias_nhwc expects ho/wo divisible by ay/ax");
+  }
+
+  const int total = n * ho * wo * k;
+  const int t = 256;
+  const int blocks = (total + t - 1) / t;
+  add_bias_nhwc_kernel<<<blocks, t>>>(d_y, d_bias, n, ho, wo, k, ay, ax, share_app_bias ? 1 : 0);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_add_block_bias_nhwc(float* d_y, const float* d_bias,
+                                int n, int ho, int wo, int k,
+                                int ay, int ax,
+                                int block_by, int block_bx,
+                                bool share_app_bias) {
+  if (!d_y || !d_bias) throw std::runtime_error("launch_add_block_bias_nhwc received null pointer");
+  if (n <= 0 || ho <= 0 || wo <= 0 || k <= 0) return;
+  if (ay <= 0 || ax <= 0) throw std::runtime_error("launch_add_block_bias_nhwc expects ay/ax > 0");
+  if (block_by <= 0 || block_bx <= 0) throw std::runtime_error("launch_add_block_bias_nhwc expects block grid > 0");
+  if ((ho % ay) != 0 || (wo % ax) != 0) {
+    throw std::runtime_error("launch_add_block_bias_nhwc expects ho/wo divisible by ay/ax");
+  }
+
+  const int base_ho = ho / ay;
+  const int base_wo = wo / ax;
+  if ((base_ho % block_by) != 0 || (base_wo % block_bx) != 0) {
+    throw std::runtime_error("launch_add_block_bias_nhwc expects base ho/wo divisible by block grid");
+  }
+  const int block_ho = base_ho / block_by;
+  const int block_wo = base_wo / block_bx;
+
+  const int total = n * ho * wo * k;
+  const int t = 256;
+  const int blocks = (total + t - 1) / t;
+  add_block_bias_nhwc_kernel<<<blocks, t>>>(d_y, d_bias, n, ho, wo, k,
+                                            ay, ax, block_by, block_bx,
+                                            block_ho, block_wo,
+                                            share_app_bias ? 1 : 0);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_add_bias_nhwc_i32(int32_t* d_y, const int32_t* d_bias,
+                              int n, int ho, int wo, int k,
+                              int ay, int ax,
+                              bool share_app_bias) {
+  if (!d_y || !d_bias) throw std::runtime_error("launch_add_bias_nhwc_i32 received null pointer");
+  if (n <= 0 || ho <= 0 || wo <= 0 || k <= 0) return;
+  if (ay <= 0 || ax <= 0) throw std::runtime_error("launch_add_bias_nhwc_i32 expects ay/ax > 0");
+  if ((ho % ay) != 0 || (wo % ax) != 0) {
+    throw std::runtime_error("launch_add_bias_nhwc_i32 expects ho/wo divisible by ay/ax");
+  }
+
+  const int total = n * ho * wo * k;
+  const int t = 256;
+  const int blocks = (total + t - 1) / t;
+  add_bias_nhwc_i32_kernel<<<blocks, t>>>(d_y, d_bias, n, ho, wo, k, ay, ax, share_app_bias ? 1 : 0);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_add_block_bias_nhwc_i32(int32_t* d_y, const int32_t* d_bias,
+                                    int n, int ho, int wo, int k,
+                                    int ay, int ax,
+                                    int block_by, int block_bx,
+                                    bool share_app_bias) {
+  if (!d_y || !d_bias) throw std::runtime_error("launch_add_block_bias_nhwc_i32 received null pointer");
+  if (n <= 0 || ho <= 0 || wo <= 0 || k <= 0) return;
+  if (ay <= 0 || ax <= 0) throw std::runtime_error("launch_add_block_bias_nhwc_i32 expects ay/ax > 0");
+  if (block_by <= 0 || block_bx <= 0) throw std::runtime_error("launch_add_block_bias_nhwc_i32 expects block grid > 0");
+  if ((ho % ay) != 0 || (wo % ax) != 0) {
+    throw std::runtime_error("launch_add_block_bias_nhwc_i32 expects ho/wo divisible by ay/ax");
+  }
+
+  const int base_ho = ho / ay;
+  const int base_wo = wo / ax;
+  if ((base_ho % block_by) != 0 || (base_wo % block_bx) != 0) {
+    throw std::runtime_error("launch_add_block_bias_nhwc_i32 expects base ho/wo divisible by block grid");
+  }
+  const int block_ho = base_ho / block_by;
+  const int block_wo = base_wo / block_bx;
+
+  const int total = n * ho * wo * k;
+  const int t = 256;
+  const int blocks = (total + t - 1) / t;
+  add_block_bias_nhwc_i32_kernel<<<blocks, t>>>(d_y, d_bias, n, ho, wo, k,
+                                                ay, ax, block_by, block_bx,
+                                                block_ho, block_wo,
+                                                share_app_bias ? 1 : 0);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_bias_grad_nhwc(const float* d_dy, float* d_db,
+                           int n, int ho, int wo, int k,
+                           int ay, int ax,
+                           bool share_app_bias) {
+  if (!d_dy || !d_db) throw std::runtime_error("launch_bias_grad_nhwc received null pointer");
+  if (n <= 0 || ho <= 0 || wo <= 0 || k <= 0) return;
+  if (ay <= 0 || ax <= 0) throw std::runtime_error("launch_bias_grad_nhwc expects ay/ax > 0");
+  if ((ho % ay) != 0 || (wo % ax) != 0) {
+    throw std::runtime_error("launch_bias_grad_nhwc expects ho/wo divisible by ay/ax");
+  }
+
+  const size_t db_elems = share_app_bias ? static_cast<size_t>(k)
+                                         : static_cast<size_t>(k) * ay * ax;
+  CUDA_CHECK(cudaMemset(d_db, 0, db_elems * sizeof(float)));
+
+  const int total = n * ho * wo * k;
+  const int t = 256;
+  const int blocks = (total + t - 1) / t;
+  bias_grad_nhwc_kernel<<<blocks, t>>>(d_dy, d_db, n, ho, wo, k, ay, ax, share_app_bias ? 1 : 0);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_block_bias_grad_nhwc(const float* d_dy, float* d_db,
+                                 int n, int ho, int wo, int k,
+                                 int ay, int ax,
+                                 int block_by, int block_bx,
+                                 bool share_app_bias) {
+  if (!d_dy || !d_db) throw std::runtime_error("launch_block_bias_grad_nhwc received null pointer");
+  if (n <= 0 || ho <= 0 || wo <= 0 || k <= 0) return;
+  if (ay <= 0 || ax <= 0) throw std::runtime_error("launch_block_bias_grad_nhwc expects ay/ax > 0");
+  if (block_by <= 0 || block_bx <= 0) throw std::runtime_error("launch_block_bias_grad_nhwc expects block grid > 0");
+  if ((ho % ay) != 0 || (wo % ax) != 0) {
+    throw std::runtime_error("launch_block_bias_grad_nhwc expects ho/wo divisible by ay/ax");
+  }
+
+  const int base_ho = ho / ay;
+  const int base_wo = wo / ax;
+  if ((base_ho % block_by) != 0 || (base_wo % block_bx) != 0) {
+    throw std::runtime_error("launch_block_bias_grad_nhwc expects base ho/wo divisible by block grid");
+  }
+  const int block_ho = base_ho / block_by;
+  const int block_wo = base_wo / block_bx;
+
+  const size_t base = static_cast<size_t>(k) * block_by * block_bx;
+  const size_t db_elems = share_app_bias ? base : base * ay * ax;
+  CUDA_CHECK(cudaMemset(d_db, 0, db_elems * sizeof(float)));
+
+  const int total = n * ho * wo * k;
+  const int t = 256;
+  const int blocks = (total + t - 1) / t;
+  block_bias_grad_nhwc_kernel<<<blocks, t>>>(d_dy, d_db, n, ho, wo, k,
+                                             ay, ax, block_by, block_bx,
+                                             block_ho, block_wo,
+                                             share_app_bias ? 1 : 0);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2509,22 +3320,27 @@ template <nnalgebra::DataType Tin>
 __global__ void pack_filter_krsc_group_qi32_kernel(const float* __restrict__ w,
                                                    int32_t* __restrict__ wg,
                                                    int r, int s, int cin_group,
+                                                   int ay, int ax,
                                                    int k_base, int kout_group,
                                                    const nnalgebra::QuantizationParameters<Tin>* f_qp) {
   const int kdim = r * s * cin_group;
+  const int ncol = kout_group * ay * ax;
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int total = kout_group * kdim;
+  const int total = ncol * kdim;
   if (idx >= total) return;
 
-  const int ko = idx / kdim;
-  const int k_idx = idx - ko * kdim;
+  const int col_ext = idx / kdim;
+  const int k_idx = idx - col_ext * kdim;
 
   const int ci = k_idx % cin_group;
   const int t = k_idx / cin_group;
   const int ss = t % s;
   const int rr = t / s;
 
-  const int32_t raw = static_cast<int32_t>(w[idx_krsc(k_base + ko, rr, ss, ci, r, s, cin_group)]);
+  int ko, ay_idx, ax_idx;
+  decode_output_app_index(col_ext, ay, ax, ko, ay_idx, ax_idx);
+  const int32_t raw = static_cast<int32_t>(w[idx_krsc(k_base + ko, rr, ss, ci, ay_idx, ax_idx,
+                                                     r, s, cin_group, ay, ax)]);
   wg[idx] = raw - nnalgebra::getZeroPoint(*f_qp);
 }
 
@@ -2533,24 +3349,28 @@ __global__ void pack_block_filter_kbybxrsc_group_qi32_kernel(const float* __rest
                                                              int32_t* __restrict__ wg,
                                                              int by_count, int bx_count,
                                                              int r, int s, int cin_group,
+                                                             int ay, int ax,
                                                              int block_y, int block_x,
                                                              int k_base, int kout_group,
                                                              const nnalgebra::QuantizationParameters<Tin>* f_qp) {
   const int kdim = r * s * cin_group;
+  const int ncol = kout_group * ay * ax;
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int total = kout_group * kdim;
+  const int total = ncol * kdim;
   if (idx >= total) return;
 
-  const int ko = idx / kdim;
-  const int k_idx = idx - ko * kdim;
+  const int col_ext = idx / kdim;
+  const int k_idx = idx - col_ext * kdim;
 
   const int ci = k_idx % cin_group;
   const int t = k_idx / cin_group;
   const int ss = t % s;
   const int rr = t / s;
 
-  const int32_t raw = static_cast<int32_t>(w[idx_kbybxrsc(k_base + ko, block_y, block_x, rr, ss, ci,
-                                                          by_count, bx_count, r, s, cin_group)]);
+  int ko, ay_idx, ax_idx;
+  decode_output_app_index(col_ext, ay, ax, ko, ay_idx, ax_idx);
+  const int32_t raw = static_cast<int32_t>(w[idx_kbybxrsc(k_base + ko, block_y, block_x, rr, ss, ci, ay_idx, ax_idx,
+                                                          by_count, bx_count, r, s, cin_group, ay, ax)]);
   wg[idx] = raw - nnalgebra::getZeroPoint(*f_qp);
 }
 
@@ -2583,6 +3403,59 @@ __global__ void unpack_matrix_to_nhwc_group_i32_kernel(const int32_t* __restrict
   const int w_idx = rem - h_idx * w;
 
   dst[idx_nhwc(n_idx, h_idx, w_idx, c_base + col, h, w, c)] = src[idx];
+}
+
+__global__ void unpack_matrix_to_nhwc_group_app_i32_rows_kernel(const int32_t* __restrict__ src,
+                                                                int32_t* __restrict__ dst,
+                                                                int n, int base_h, int base_w,
+                                                                int ay, int ax,
+                                                                int row_start, int row_count,
+                                                                int c, int c_base, int c_count) {
+  const int ncol = c_count * ay * ax;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = row_count * ncol;
+  if (idx >= total) return;
+
+  const int local_row = idx / ncol;
+  const int ext_col = idx - local_row * ncol;
+  const int row = row_start + local_row;
+
+  int ko, ay_idx, ax_idx;
+  decode_output_app_index(ext_col, ay, ax, ko, ay_idx, ax_idx);
+  int n_idx, ho_base, wo_base;
+  decode_conv_row(row, base_h, base_w, n_idx, ho_base, wo_base);
+  dst[idx_nhwc(n_idx, ho_base * ay + ay_idx, wo_base * ax + ax_idx,
+               c_base + ko, base_h * ay, base_w * ax, c)] = src[idx];
+}
+
+__global__ void unpack_matrix_to_nhwc_group_app_block_i32_rows_kernel(const int32_t* __restrict__ src,
+                                                                      int32_t* __restrict__ dst,
+                                                                      int n, int base_h, int base_w, int c,
+                                                                      int ho_start_base, int wo_start_base,
+                                                                      int block_ho_base, int block_wo_base,
+                                                                      int ay, int ax,
+                                                                      int row_start, int row_count,
+                                                                      int c_base, int c_count) {
+  const int ncol = c_count * ay * ax;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = row_count * ncol;
+  if (idx >= total) return;
+
+  const int local_row = idx / ncol;
+  const int ext_col = idx - local_row * ncol;
+  const int row = row_start + local_row;
+
+  int ko, ay_idx, ax_idx;
+  decode_output_app_index(ext_col, ay, ax, ko, ay_idx, ax_idx);
+
+  const int n_idx = row / (block_ho_base * block_wo_base);
+  const int rem = row - n_idx * (block_ho_base * block_wo_base);
+  const int lho = rem / block_wo_base;
+  const int lwo = rem - lho * block_wo_base;
+  const int ho_base = ho_start_base + lho;
+  const int wo_base = wo_start_base + lwo;
+  dst[idx_nhwc(n_idx, ho_base * ay + ay_idx, wo_base * ax + ax_idx,
+               c_base + ko, base_h * ay, base_w * ax, c)] = src[idx];
 }
 
 __global__ void unpack_matrix_to_nhwc_group_app_kernel(const float* __restrict__ src,
@@ -2692,16 +3565,13 @@ void launch_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, int32_t* d_
                                  const nnalgebra::QuantizationParameters<Tin>* in_qp,
                                  const nnalgebra::QuantizationParameters<Tin>* f_qp,
                                  nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp) {
-  if (p.ay != 1 || p.ax != 1) {
-    throw std::runtime_error("quantized NHWC fprop does not support ay/ax != 1");
-  }
   TensorNHWC x_shape(n, h, w, c);
-  FilterKRSC w_shape(r, s, c / p.groups, k);
+  FilterKRSC w_shape(r, s, c / p.groups, k, p.ay, p.ax);
   const ConvShape sh = infer_conv_shape(x_shape, w_shape, p);
 
-  const int m = n * sh.ho * sh.wo;
+  const int m = n * sh.base_ho * sh.base_wo;
   const int kdim = r * s * sh.cin_group;
-  const int ncol = sh.kout_group;
+  const int ncol = sh.kout_group * p.ay * p.ax;
   const int t = 256;
 
   QuantizedWorkspace ws;
@@ -2717,31 +3587,34 @@ void launch_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, int32_t* d_
 
     const int total_col = m * kdim;
     const int blocks_col = (total_col + t - 1) / t;
-    im2col_nhwc_qi32_kernel<Tin><<<blocks_col, t>>>(d_x, ws.d_col,
-                                                    n, h, w, c,
-                                                    sh.ho, sh.wo,
-                                                    r, s,
-                                                    p.pad_h, p.pad_w,
-                                                    p.stride_h, p.stride_w,
-                                                    p.dilation_h, p.dilation_w,
-                                                    cin_base, sh.cin_group,
-                                                    in_qp);
+    im2col_nhwc_rows_typed_kernel<int32_t, nnalgebra::QuantizationParameters<Tin>><<<blocks_col, t>>>(d_x, ws.d_col,
+                                                                                                       n, h, w, c,
+                                                                                                       sh.base_ho, sh.base_wo,
+                                                                                                       0, m,
+                                                                                                       r, s,
+                                                                                                       p.pad_h, p.pad_w,
+                                                                                                       p.stride_h, p.stride_w,
+                                                                                                       p.dilation_h, p.dilation_w,
+                                                                                                       cin_base, sh.cin_group,
+                                                                                                       in_qp);
 
     const int total_wg = kdim * ncol;
     const int blocks_wg = (total_wg + t - 1) / t;
-    pack_filter_krsc_group_qi32_kernel<Tin><<<blocks_wg, t>>>(d_w, ws.d_wg,
-                                                              r, s, sh.cin_group,
-                                                              kout_base, sh.kout_group,
-                                                              f_qp);
+    pack_filter_krsc_group_typed_kernel<int32_t, nnalgebra::QuantizationParameters<Tin>><<<blocks_wg, t>>>(d_w, ws.d_wg,
+                                                                                                             r, s, sh.cin_group,
+                                                                                                             p.ay, p.ax,
+                                                                                                             kout_base, sh.kout_group,
+                                                                                                             f_qp);
 
     bmm_matmul_i32(ws.d_col, ws.d_wg, ws.d_ymat, 1, m, ncol, kdim,
                    BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_YES);
 
     const int total_ym = m * ncol;
     const int blocks_ym = (total_ym + t - 1) / t;
-    unpack_matrix_to_nhwc_group_i32_kernel<<<blocks_ym, t>>>(ws.d_ymat, d_y,
-                                                             n, sh.ho, sh.wo, k,
-                                                             kout_base, sh.kout_group);
+    unpack_matrix_to_nhwc_group_app_rows_typed_kernel<int32_t><<<blocks_ym, t>>>(ws.d_ymat, d_y,
+                                                                                  n, sh.base_ho, sh.base_wo, p.ay, p.ax,
+                                                                                  0, m,
+                                                                                  k, kout_base, sh.kout_group);
   }
 
   if (out_qp) {
@@ -2759,16 +3632,13 @@ void launch_block_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, int32
                                        const nnalgebra::QuantizationParameters<Tin>* in_qp,
                                        const nnalgebra::QuantizationParameters<Tin>* f_qp,
                                        nnalgebra::QuantizationParameters<nnalgebra::DataType::LinQuantI32>* out_qp) {
-  if (p.conv.ay != 1 || p.conv.ax != 1) {
-    throw std::runtime_error("quantized blocked NHWC fprop does not support ay/ax != 1");
-  }
   TensorNHWC x_shape(n, h, w, c);
-  BlockFilterKByBxRSC w_shape(k, p.block_by, p.block_bx, r, s, c / p.conv.groups);
+  BlockFilterKByBxRSC w_shape(k, p.block_by, p.block_bx, r, s, c / p.conv.groups, p.conv.ay, p.conv.ax);
   const BlockConvShape sh = infer_block_conv_shape(x_shape, w_shape, p);
 
   const int m_block = n * sh.block_ho * sh.block_wo;
   const int kdim = r * s * sh.base.cin_group;
-  const int ncol = sh.base.kout_group;
+  const int ncol = sh.base.kout_group * p.conv.ay * p.conv.ax;
   const int t = 256;
 
   QuantizedWorkspace ws;
@@ -2788,36 +3658,40 @@ void launch_block_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, int32
 
         const int total_col = m_block * kdim;
         const int blocks_col = (total_col + t - 1) / t;
-        im2col_nhwc_block_qi32_kernel<Tin><<<blocks_col, t>>>(d_x, ws.d_col,
-                                                              n, h, w, c,
-                                                              ho_start, wo_start,
-                                                              sh.block_ho, sh.block_wo,
-                                                              r, s,
-                                                              p.conv.pad_h, p.conv.pad_w,
-                                                              p.conv.stride_h, p.conv.stride_w,
-                                                              p.conv.dilation_h, p.conv.dilation_w,
-                                                              cin_base, sh.base.cin_group,
-                                                              in_qp);
+        im2col_nhwc_block_rows_typed_kernel<int32_t, nnalgebra::QuantizationParameters<Tin>><<<blocks_col, t>>>(d_x, ws.d_col,
+                                                                                                                  n, h, w, c,
+                                                                                                                  ho_start, wo_start,
+                                                                                                                  sh.block_ho, sh.block_wo,
+                                                                                                                  0, m_block,
+                                                                                                                  r, s,
+                                                                                                                  p.conv.pad_h, p.conv.pad_w,
+                                                                                                                  p.conv.stride_h, p.conv.stride_w,
+                                                                                                                  p.conv.dilation_h, p.conv.dilation_w,
+                                                                                                                  cin_base, sh.base.cin_group,
+                                                                                                                  in_qp);
 
         const int total_wg = kdim * ncol;
         const int blocks_wg = (total_wg + t - 1) / t;
-        pack_block_filter_kbybxrsc_group_qi32_kernel<Tin><<<blocks_wg, t>>>(d_w, ws.d_wg,
-                                                                            p.block_by, p.block_bx,
-                                                                            r, s, sh.base.cin_group,
-                                                                            by, bx,
-                                                                            kout_base, sh.base.kout_group,
-                                                                            f_qp);
+        pack_block_filter_kbybxrsc_group_typed_kernel<int32_t, nnalgebra::QuantizationParameters<Tin>><<<blocks_wg, t>>>(d_w, ws.d_wg,
+                                                                                                                           p.block_by, p.block_bx,
+                                                                                                                           r, s, sh.base.cin_group,
+                                                                                                                           p.conv.ay, p.conv.ax,
+                                                                                                                           by, bx,
+                                                                                                                           kout_base, sh.base.kout_group,
+                                                                                                                           f_qp);
 
         bmm_matmul_i32(ws.d_col, ws.d_wg, ws.d_ymat, 1, m_block, ncol, kdim,
                        BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_YES);
 
         const int total_ym = m_block * ncol;
         const int blocks_ym = (total_ym + t - 1) / t;
-        unpack_matrix_to_nhwc_group_block_i32_kernel<<<blocks_ym, t>>>(ws.d_ymat, d_y,
-                                                                       n, sh.base.ho, sh.base.wo, k,
-                                                                       ho_start, wo_start,
-                                                                       sh.block_ho, sh.block_wo,
-                                                                       kout_base, sh.base.kout_group);
+        unpack_matrix_to_nhwc_group_app_block_rows_typed_kernel<int32_t><<<blocks_ym, t>>>(ws.d_ymat, d_y,
+                                                                                             n, sh.base.base_ho, sh.base.base_wo, k,
+                                                                                             ho_start, wo_start,
+                                                                                             sh.block_ho, sh.block_wo,
+                                                                                             p.conv.ay, p.conv.ax,
+                                                                                             0, m_block,
+                                                                                             kout_base, sh.base.kout_group);
       }
     }
   }

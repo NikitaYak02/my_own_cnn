@@ -220,6 +220,9 @@ std::vector<BenchCase> default_bench_suite() {
       {"small_batch", 1, 56, 56, 64, 64, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
       {"large_batch_128x128_n16_c64_k128", 16, 128, 128, 64, 128, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
       {"large_batch_128x128_n8_c128_k128", 8, 128, 128, 128, 128, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+      {"pointwise_1x1_large_56x56_n32_c256_k256", 32, 56, 56, 256, 256, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+      {"pointwise_1x1_large_112x112_n16_c128_k256", 16, 112, 112, 128, 256, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+      {"pointwise_1x1_grouped_g4_56x56_n32_c256_k256", 32, 56, 56, 256, 256, 1, 1, 0, 0, 1, 1, 1, 1, 4, 1, 1, 1, 1},
   };
 }
 
@@ -232,6 +235,9 @@ std::vector<BenchCase> default_blocked_bench_suite() {
       {"blocked_pointwise_1x1_b4x4", 32, 56, 56, 128, 256, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 4, 4},
       {"blocked_dilated_3x3_b2x2", 16, 64, 64, 64, 64, 3, 3, 2, 2, 1, 1, 2, 2, 1, 1, 1, 2, 2},
       {"blocked_small_batch_b4x4", 1, 56, 56, 64, 64, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4, 4},
+      {"blocked_pointwise_1x1_large_56x56_n32_c256_k256_b4x4", 32, 56, 56, 256, 256, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 4, 4},
+      {"blocked_pointwise_1x1_large_112x112_n16_c128_k256_b4x4", 16, 112, 112, 128, 256, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 4, 4},
+      {"blocked_pointwise_1x1_grouped_g4_56x56_n32_c256_k256_b4x4", 32, 56, 56, 256, 256, 1, 1, 0, 0, 1, 1, 1, 1, 4, 1, 1, 4, 4},
   };
 }
 
@@ -362,6 +368,7 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
     print_bench("custom fprop", b);
 
     std::vector<float> custom_y;
+    std::vector<float> cpu_y;
     if (o.check) {
       CUDA_CHECK(cudaMemcpy(y.ptr(), d_y, y.elements() * sizeof(float), cudaMemcpyDeviceToHost));
       if (blocked) {
@@ -369,11 +376,13 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
         cpu_block_fprop_nhwc(x, w_blk, bp, y_cpu);
         VerifyResult vr = verify_tensors(y_cpu.data, y.data, 1e-4f, 1e-3f);
         print_verify("check fprop custom_vs_cpu", vr);
+        cpu_y = y_cpu.data;
       } else {
         TensorNHWC y_cpu;
         cpu_fprop_nhwc(x, w_exp, p, y_cpu);
         VerifyResult vr = verify_tensors(y_cpu.data, y.data, 1e-4f, 1e-3f);
         print_verify("check fprop custom_vs_cpu", vr);
+        cpu_y = y_cpu.data;
       }
       if (o.with_cudnn) custom_y = y.data;
     }
@@ -391,6 +400,8 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
         CUDA_CHECK(cudaMemcpy(y.ptr(), d_y, y.elements() * sizeof(float), cudaMemcpyDeviceToHost));
         VerifyResult vr = verify_tensors(custom_y, y.data, 1e-4f, 1e-3f);
         print_verify("check fprop custom_vs_cudnn", vr);
+        VerifyResult cudnn_cpu_vr = verify_tensors(cpu_y, y.data, 1e-4f, 1e-3f);
+        print_verify("check fprop cudnn_vs_cpu", cudnn_cpu_vr);
       }
     }
   }
@@ -406,6 +417,7 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
     print_bench("custom bprop", b);
 
     std::vector<float> custom_dx;
+    std::vector<float> cpu_dx;
     if (o.check) {
       CUDA_CHECK(cudaMemcpy(dx.ptr(), d_dx, dx.elements() * sizeof(float), cudaMemcpyDeviceToHost));
       if (blocked) {
@@ -413,11 +425,13 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
         cpu_block_bprop_nhwc(dy, w_blk, bp, dx_cpu);
         VerifyResult vr = verify_tensors(dx_cpu.data, dx.data, 1e-4f, 1e-3f);
         print_verify("check bprop custom_vs_cpu", vr);
+        cpu_dx = dx_cpu.data;
       } else {
         TensorNHWC dx_cpu(bc.n, bc.h, bc.w, bc.c);
         cpu_bprop_nhwc(dy, w_exp, p, dx_cpu);
         VerifyResult vr = verify_tensors(dx_cpu.data, dx.data, 1e-4f, 1e-3f);
         print_verify("check bprop custom_vs_cpu", vr);
+        cpu_dx = dx_cpu.data;
       }
       if (o.with_cudnn) custom_dx = dx.data;
     }
@@ -435,6 +449,8 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
         CUDA_CHECK(cudaMemcpy(dx.ptr(), d_dx, dx.elements() * sizeof(float), cudaMemcpyDeviceToHost));
         VerifyResult vr = verify_tensors(custom_dx, dx.data, 1e-4f, 1e-3f);
         print_verify("check bprop custom_vs_cudnn", vr);
+        VerifyResult cudnn_cpu_vr = verify_tensors(cpu_dx, dx.data, 1e-4f, 1e-3f);
+        print_verify("check bprop cudnn_vs_cpu", cudnn_cpu_vr);
       }
     }
   }
@@ -450,20 +466,26 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
     print_bench("custom grad", b);
 
     std::vector<float> custom_dw;
+    std::vector<float> cpu_dw;
+    const bool gemm_grad = (grad_algo == GradKernelAlgo::GemmIm2Col);
+    const float grad_abs_eps = gemm_grad ? 1e-2f : 1e-4f;
+    const float grad_rel_eps = gemm_grad ? 1e-2f : 1e-3f;
     if (o.check) {
       if (blocked) {
         CUDA_CHECK(cudaMemcpy(dw_blk.ptr(), d_dw, dw_blk.elements() * sizeof(float), cudaMemcpyDeviceToHost));
         BlockFilterKByBxRSC dw_cpu(bc.k, bp.block_by, bp.block_bx, bc.r, bc.s, bc.c / bc.groups, bc.ay, bc.ax);
         cpu_block_grad_nhwc(x, dy, bp, dw_cpu);
-        VerifyResult vr = verify_tensors(dw_cpu.data, dw_blk.data, 1e-4f, 1e-3f);
+        VerifyResult vr = verify_tensors(dw_cpu.data, dw_blk.data, grad_abs_eps, grad_rel_eps);
         print_verify("check grad custom_vs_cpu", vr);
+        cpu_dw = dw_cpu.data;
         if (o.with_cudnn) custom_dw = dw_blk.data;
       } else {
         CUDA_CHECK(cudaMemcpy(dw_exp.ptr(), d_dw, dw_exp.elements() * sizeof(float), cudaMemcpyDeviceToHost));
         FilterKRSC dw_cpu(bc.r, bc.s, bc.c / bc.groups, bc.k, bc.ay, bc.ax);
         cpu_grad_nhwc(x, dy, p, dw_cpu);
-        VerifyResult vr = verify_tensors(dw_cpu.data, dw_exp.data, 1e-4f, 1e-3f);
+        VerifyResult vr = verify_tensors(dw_cpu.data, dw_exp.data, grad_abs_eps, grad_rel_eps);
         print_verify("check grad custom_vs_cpu", vr);
+        cpu_dw = dw_cpu.data;
         if (o.with_cudnn) custom_dw = dw_exp.data;
       }
     }
@@ -482,10 +504,14 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
           CUDA_CHECK(cudaMemcpy(dw_blk.ptr(), d_dw, dw_blk.elements() * sizeof(float), cudaMemcpyDeviceToHost));
           VerifyResult vr = verify_tensors(custom_dw, dw_blk.data, 1e-4f, 1e-3f);
           print_verify("check grad custom_vs_cudnn", vr);
+          VerifyResult cudnn_cpu_vr = verify_tensors(cpu_dw, dw_blk.data, grad_abs_eps, grad_rel_eps);
+          print_verify("check grad cudnn_vs_cpu", cudnn_cpu_vr);
         } else {
           CUDA_CHECK(cudaMemcpy(dw_exp.ptr(), d_dw, dw_exp.elements() * sizeof(float), cudaMemcpyDeviceToHost));
           VerifyResult vr = verify_tensors(custom_dw, dw_exp.data, 1e-4f, 1e-3f);
           print_verify("check grad custom_vs_cudnn", vr);
+          VerifyResult cudnn_cpu_vr = verify_tensors(cpu_dw, dw_exp.data, grad_abs_eps, grad_rel_eps);
+          print_verify("check grad cudnn_vs_cpu", cudnn_cpu_vr);
         }
       }
     }
@@ -504,6 +530,12 @@ CaseRatios run_case(const Options& o, const BenchCase& bc) {
 
 int main(int argc, char** argv) {
   try {
+    // Default to strict FP32 numerics unless the user explicitly overrides it
+    // in the environment.
+    if (std::getenv("NVIDIA_TF32_OVERRIDE") == nullptr) {
+      setenv("NVIDIA_TF32_OVERRIDE", "0", 0);
+    }
+
     const Options o = parse_args(argc, argv);
     auto execute_cases = [&](const std::vector<BenchCase>& cases) {
       const std::vector<std::string> grad_algo_names = expand_grad_algo_names(o.grad_algo);

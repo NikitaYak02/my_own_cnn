@@ -2,11 +2,13 @@
 #include "cuda_utils.h"
 
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -79,6 +81,30 @@ struct PreparedCase {
     cudaFree(d_y);
   }
 };
+
+struct StageTimesMs {
+  double memset_ms = 0.0;
+  double launch_ms = 0.0;
+  double memcpy_ms = 0.0;
+  double verify_ms = 0.0;
+  int samples = 0;
+};
+
+double measure_cuda_stage_ms(const std::function<void()>& fn) {
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+  CUDA_CHECK(cudaEventCreate(&start));
+  CUDA_CHECK(cudaEventCreate(&stop));
+  CUDA_CHECK(cudaEventRecord(start));
+  fn();
+  CUDA_CHECK(cudaEventRecord(stop));
+  CUDA_CHECK(cudaEventSynchronize(stop));
+  float ms = 0.0f;
+  CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+  CUDA_CHECK(cudaEventDestroy(start));
+  CUDA_CHECK(cudaEventDestroy(stop));
+  return static_cast<double>(ms);
+}
 
 std::string describe_case(const PreparedCase& tc) {
   std::ostringstream oss;
@@ -158,20 +184,31 @@ std::unique_ptr<PreparedCase> prepare_case(const LayerSpec& spec, int salt) {
   return tc;
 }
 
-void run_pass(std::vector<std::unique_ptr<PreparedCase>>& cases, int pass_idx) {
+void run_pass(std::vector<std::unique_ptr<PreparedCase>>& cases,
+              int pass_idx,
+              std::unordered_map<std::string, StageTimesMs>& timing_by_layer) {
   for (auto& tc_ptr : cases) {
     PreparedCase& tc = *tc_ptr;
     with_case_context(tc, pass_idx, [&]() {
-      CUDA_CHECK(cudaMemset(tc.d_y, 0, tc.y_ref.elements() * sizeof(float)));
+      StageTimesMs& t = timing_by_layer[tc.spec.name];
 
-      launch_fprop_nhwc(tc.d_x, tc.d_w, tc.d_y,
-                        tc.spec.n, tc.spec.h, tc.spec.w, tc.spec.c,
-                        tc.spec.r, tc.spec.s, tc.spec.k, tc.p);
-      CUDA_CHECK(cudaPeekAtLastError());
-      CUDA_CHECK(cudaDeviceSynchronize());
+      t.memset_ms += measure_cuda_stage_ms([&]() {
+        CUDA_CHECK(cudaMemset(tc.d_y, 0, tc.y_ref.elements() * sizeof(float)));
+      });
+
+      t.launch_ms += measure_cuda_stage_ms([&]() {
+        launch_fprop_nhwc(tc.d_x, tc.d_w, tc.d_y,
+                          tc.spec.n, tc.spec.h, tc.spec.w, tc.spec.c,
+                          tc.spec.r, tc.spec.s, tc.spec.k, tc.p);
+        CUDA_CHECK(cudaPeekAtLastError());
+      });
 
       std::vector<float> y_cuda(tc.y_ref.elements());
-      CUDA_CHECK(cudaMemcpy(y_cuda.data(), tc.d_y, y_cuda.size() * sizeof(float), cudaMemcpyDeviceToHost));
+      t.memcpy_ms += measure_cuda_stage_ms([&]() {
+        CUDA_CHECK(cudaMemcpy(y_cuda.data(), tc.d_y, y_cuda.size() * sizeof(float), cudaMemcpyDeviceToHost));
+      });
+
+      const auto verify_start = std::chrono::steady_clock::now();
 
       const VerifyResult ref_vr = verify_tensors(tc.y_ref.data, y_cuda, 1e-4f, 1e-3f);
       expect_passed(ref_vr, tc, pass_idx, "custom_vs_cpu");
@@ -182,6 +219,9 @@ void run_pass(std::vector<std::unique_ptr<PreparedCase>>& cases, int pass_idx) {
         const VerifyResult replay_vr = verify_tensors(tc.first_pass_output, y_cuda, 0.0f, 0.0f);
         expect_passed(replay_vr, tc, pass_idx, "replay_consistency");
       }
+      const auto verify_end = std::chrono::steady_clock::now();
+      t.verify_ms += std::chrono::duration<double, std::milli>(verify_end - verify_start).count();
+      t.samples += 1;
     });
   }
 }
@@ -190,6 +230,7 @@ void run_pass(std::vector<std::unique_ptr<PreparedCase>>& cases, int pass_idx) {
 
 int main() {
   try {
+    std::unordered_map<std::string, StageTimesMs> timing_by_layer;
     std::vector<std::unique_ptr<PreparedCase>> cases;
     const std::vector<LayerSpec> specs = make_layer_specs();
     cases.reserve(specs.size());
@@ -197,11 +238,25 @@ int main() {
       cases.push_back(prepare_case(specs[i], static_cast<int>(i) * 13 + 7));
     }
 
-    run_pass(cases, 0);
-    run_pass(cases, 1);
+    run_pass(cases, 0, timing_by_layer);
+    run_pass(cases, 1, timing_by_layer);
 
     std::cout << "conv_chain_test passed\n";
     std::cout << "cases=" << cases.size() << " passes=2\n";
+    std::cout << "timing_breakdown_ms_per_layer:\n";
+    for (const auto& tc_ptr : cases) {
+      const auto it = timing_by_layer.find(tc_ptr->spec.name);
+      if (it == timing_by_layer.end() || it->second.samples == 0) continue;
+      const StageTimesMs& t = it->second;
+      const double inv = 1.0 / static_cast<double>(t.samples);
+      std::cout << "  " << tc_ptr->spec.name
+                << " memset=" << (t.memset_ms * inv)
+                << " launch=" << (t.launch_ms * inv)
+                << " memcpy=" << (t.memcpy_ms * inv)
+                << " verify=" << (t.verify_ms * inv)
+                << " samples=" << t.samples
+                << "\n";
+    }
     return 0;
   } catch (const std::exception& e) {
     std::cerr << "conv_chain_test failed: " << e.what() << "\n";

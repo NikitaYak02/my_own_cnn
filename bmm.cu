@@ -72,7 +72,8 @@ static bool ensure_cublaslt_workspace(CublasContext& ctx, size_t bytes) {
 static bool launch_cublaslt_transpose_a_path(
     const float* A, const float* B, float* C,
     int batch, int M, int N, int K,
-    bool accumulate)
+    bool accumulate,
+    cudaStream_t stream)
 {
     CublasContext& ctx = get_cublas_context();
     if (ctx.lt_handle == nullptr) {
@@ -142,7 +143,7 @@ static bool launch_cublaslt_transpose_a_path(
                                                  &heuristics[i].algo,
                                                  ctx.lt_workspace,
                                                  ctx.lt_workspace_cap,
-                                                 nullptr);
+                                                 stream);
         if (st == CUBLAS_STATUS_SUCCESS) {
             ok = true;
             break;
@@ -161,7 +162,8 @@ cleanup:
 static bool launch_cublas_transpose_a_path(
     const float* A, const float* B, float* C,
     int batch, int M, int N, int K,
-    bool accumulate)
+    bool accumulate,
+    cudaStream_t stream)
 {
     CublasContext& ctx = get_cublas_context();
     if (ctx.handle == nullptr) {
@@ -170,6 +172,7 @@ static bool launch_cublas_transpose_a_path(
 
     const float alpha = 1.0f;
     const float beta = accumulate ? 1.0f : 0.0f;
+    cublasSetStream(ctx.handle, stream);
     const cublasStatus_t st = cublasSgemmStridedBatched(
         ctx.handle,
         CUBLAS_OP_N, CUBLAS_OP_T,
@@ -187,7 +190,8 @@ static bool launch_cublas_transpose_a_path(
 static bool launch_cublas_transpose_b_path(
     const float* A, const float* B, float* C,
     int batch, int M, int N, int K,
-    bool accumulate)
+    bool accumulate,
+    cudaStream_t stream)
 {
     CublasContext& ctx = get_cublas_context();
     if (ctx.handle == nullptr) {
@@ -202,6 +206,7 @@ static bool launch_cublas_transpose_b_path(
     const float alpha = 1.0f;
     const float beta = accumulate ? 1.0f : 0.0f;
     cublasSetMathMode(ctx.handle, CUBLAS_DEFAULT_MATH);
+    cublasSetStream(ctx.handle, stream);
 
     cublasStatus_t st = CUBLAS_STATUS_NOT_INITIALIZED;
     if (batch == 1) {
@@ -245,11 +250,11 @@ static bool launch_cublas_transpose_b_path(
 /*  coalesced reads for the transposed operand as well.               */
 /* ------------------------------------------------------------------ */
 
-template <bool TRANS_A, bool TRANS_B, bool ACCUM>
+template <typename T, bool TRANS_A, bool TRANS_B, bool ACCUM>
 __global__ void bmm_tiled_kernel(
-    const float* __restrict__ A,
-    const float* __restrict__ B,
-    float* __restrict__ C,
+    const T* __restrict__ A,
+    const T* __restrict__ B,
+    T* __restrict__ C,
     int batch, int M, int N, int K,
     int tiles_m, int tiles_n,
     size_t tile_block_offset)
@@ -278,15 +283,16 @@ __global__ void bmm_tiled_kernel(
     const int out_col0 = tile_col + local_col;
 
     // Advance pointers to the current batch slice.
-    const float* An = A + static_cast<size_t>(batch_idx) * M * K;
-    const float* Bn = B + static_cast<size_t>(batch_idx) * K * N;
-    float* Cn = C + static_cast<size_t>(batch_idx) * M * N;
+    const T* An = A + static_cast<size_t>(batch_idx) * M * K;
+    const T* Bn = B + static_cast<size_t>(batch_idx) * K * N;
+    T* Cn = C + static_cast<size_t>(batch_idx) * M * N;
 
     // Shared-memory tiles include a small pad to reduce bank conflicts.
-    __shared__ float As[kBlockRows][kBlockDepth + kSharedPad];
-    __shared__ float Bs[kBlockDepth][kBlockCols + kSharedPad];
+    __shared__ T As[kBlockRows][kBlockDepth + kSharedPad];
+    __shared__ T Bs[kBlockDepth][kBlockCols + kSharedPad];
 
-    float acc[kThreadRows][kThreadCols] = {{0.0f, 0.0f}, {0.0f, 0.0f}};
+    T acc[kThreadRows][kThreadCols] = {{static_cast<T>(0), static_cast<T>(0)},
+                                       {static_cast<T>(0), static_cast<T>(0)}};
 
     for (int k0 = 0; k0 < K; k0 += kBlockDepth) {
         // Cooperative tile load. Compile-time specialization keeps the
@@ -298,14 +304,14 @@ __global__ void bmm_tiled_kernel(
             const int g_m = tile_row + load_m;
             const int g_k = k0 + load_k;
             As[load_m][load_k] =
-                (g_m < M && g_k < K) ? An[g_k * M + g_m] : 0.0f;
+                (g_m < M && g_k < K) ? An[g_k * M + g_m] : static_cast<T>(0);
         } else {
             const int load_m = tid / kBlockDepth;
             const int load_k = tid % kBlockDepth;
             const int g_m = tile_row + load_m;
             const int g_k = k0 + load_k;
             As[load_m][load_k] =
-                (g_m < M && g_k < K) ? An[g_m * K + g_k] : 0.0f;
+                (g_m < M && g_k < K) ? An[g_m * K + g_k] : static_cast<T>(0);
         }
 
         if constexpr (TRANS_B) {
@@ -314,24 +320,24 @@ __global__ void bmm_tiled_kernel(
             const int g_n = tile_col + load_n;
             const int g_k = k0 + load_k;
             Bs[load_k][load_n] =
-                (g_n < N && g_k < K) ? Bn[g_n * K + g_k] : 0.0f;
+                (g_n < N && g_k < K) ? Bn[g_n * K + g_k] : static_cast<T>(0);
         } else {
             const int load_k = tid / kBlockCols;
             const int load_n = tid % kBlockCols;
             const int g_n = tile_col + load_n;
             const int g_k = k0 + load_k;
             Bs[load_k][load_n] =
-                (g_n < N && g_k < K) ? Bn[g_k * N + g_n] : 0.0f;
+                (g_n < N && g_k < K) ? Bn[g_k * N + g_n] : static_cast<T>(0);
         }
 
         __syncthreads();
 
         #pragma unroll
         for (int kk = 0; kk < kBlockDepth; ++kk) {
-            const float a0 = As[local_row + 0][kk];
-            const float a1 = As[local_row + 1][kk];
-            const float b0 = Bs[kk][local_col + 0];
-            const float b1 = Bs[kk][local_col + 1];
+            const T a0 = As[local_row + 0][kk];
+            const T a1 = As[local_row + 1][kk];
+            const T b0 = Bs[kk][local_col + 0];
+            const T b1 = Bs[kk][local_col + 1];
 
             acc[0][0] += a0 * b0;
             acc[0][1] += a0 * b1;
@@ -344,11 +350,13 @@ __global__ void bmm_tiled_kernel(
 
     // Store the thread-local 2x2 output fragment with boundary checks for
     // partially covered tiles on matrix edges.
+    #pragma unroll
     for (int i = 0; i < kThreadRows; ++i) {
         const int out_row = out_row0 + i;
         if (out_row >= M) {
             continue;
         }
+        #pragma unroll
         for (int j = 0; j < kThreadCols; ++j) {
             const int out_col = out_col0 + j;
             if (out_col < N) {
@@ -362,15 +370,16 @@ __global__ void bmm_tiled_kernel(
     }
 }
 
-template <bool TRANS_A, bool TRANS_B, bool ACCUM>
+template <typename T, bool TRANS_A, bool TRANS_B, bool ACCUM>
 static void launch_bmm_kernel(
-    const float* A,
-    const float* B,
-    float* C,
+    const T* A,
+    const T* B,
+    T* C,
     int batch,
     int M,
     int N,
-    int K)
+    int K,
+    cudaStream_t stream)
 {
     if (batch <= 0 || M <= 0 || N <= 0 || K <= 0) {
         return;
@@ -389,144 +398,7 @@ static void launch_bmm_kernel(
                 ? kMaxGridX
                 : static_cast<unsigned int>(remaining_tiles);
         dim3 grid(grid_x, 1, 1);
-        bmm_tiled_kernel<TRANS_A, TRANS_B, ACCUM><<<grid, block>>>(
-            A, B, C, batch, M, N, K, tiles_m, tiles_n, tile_offset);
-        tile_offset += grid_x;
-    }
-}
-
-template <bool TRANS_A, bool TRANS_B>
-__global__ void bmm_tiled_i32_kernel(
-    const int32_t* __restrict__ A,
-    const int32_t* __restrict__ B,
-    int32_t* __restrict__ C,
-    int batch, int M, int N, int K,
-    int tiles_m, int tiles_n,
-    size_t tile_block_offset)
-{
-    const size_t linear_tile = tile_block_offset + static_cast<size_t>(blockIdx.x);
-    const size_t tile_row_batch = linear_tile / static_cast<size_t>(tiles_n);
-    const size_t batch_linear = tile_row_batch / static_cast<size_t>(tiles_m);
-    if (batch_linear >= static_cast<size_t>(batch)) {
-        return;
-    }
-
-    const int batch_idx = static_cast<int>(batch_linear);
-    const int tile_row_idx = static_cast<int>(tile_row_batch - batch_linear * static_cast<size_t>(tiles_m));
-    const int tile_col_idx = static_cast<int>(linear_tile - tile_row_batch * static_cast<size_t>(tiles_n));
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
-    const int tid = ty * blockDim.x + tx;
-
-    const int tile_row = tile_row_idx * kBlockRows;
-    const int tile_col = tile_col_idx * kBlockCols;
-    const int local_row = ty * kThreadRows;
-    const int local_col = tx * kThreadCols;
-    const int out_row0 = tile_row + local_row;
-    const int out_col0 = tile_col + local_col;
-
-    const int32_t* An = A + static_cast<size_t>(batch_idx) * M * K;
-    const int32_t* Bn = B + static_cast<size_t>(batch_idx) * K * N;
-    int32_t* Cn = C + static_cast<size_t>(batch_idx) * M * N;
-
-    __shared__ int32_t As[kBlockRows][kBlockDepth + kSharedPad];
-    __shared__ int32_t Bs[kBlockDepth][kBlockCols + kSharedPad];
-
-    int32_t acc[kThreadRows][kThreadCols] = {{0, 0}, {0, 0}};
-
-    for (int k0 = 0; k0 < K; k0 += kBlockDepth) {
-        if constexpr (TRANS_A) {
-            const int load_k = tid / kBlockRows;
-            const int load_m = tid % kBlockRows;
-            const int g_m = tile_row + load_m;
-            const int g_k = k0 + load_k;
-            As[load_m][load_k] =
-                (g_m < M && g_k < K) ? An[g_k * M + g_m] : 0;
-        } else {
-            const int load_m = tid / kBlockDepth;
-            const int load_k = tid % kBlockDepth;
-            const int g_m = tile_row + load_m;
-            const int g_k = k0 + load_k;
-            As[load_m][load_k] =
-                (g_m < M && g_k < K) ? An[g_m * K + g_k] : 0;
-        }
-
-        if constexpr (TRANS_B) {
-            const int load_n = tid / kBlockDepth;
-            const int load_k = tid % kBlockDepth;
-            const int g_n = tile_col + load_n;
-            const int g_k = k0 + load_k;
-            Bs[load_k][load_n] =
-                (g_n < N && g_k < K) ? Bn[g_n * K + g_k] : 0;
-        } else {
-            const int load_k = tid / kBlockCols;
-            const int load_n = tid % kBlockCols;
-            const int g_n = tile_col + load_n;
-            const int g_k = k0 + load_k;
-            Bs[load_k][load_n] =
-                (g_n < N && g_k < K) ? Bn[g_k * N + g_n] : 0;
-        }
-
-        __syncthreads();
-
-        #pragma unroll
-        for (int kk = 0; kk < kBlockDepth; ++kk) {
-            const int32_t a0 = As[local_row + 0][kk];
-            const int32_t a1 = As[local_row + 1][kk];
-            const int32_t b0 = Bs[kk][local_col + 0];
-            const int32_t b1 = Bs[kk][local_col + 1];
-
-            acc[0][0] += a0 * b0;
-            acc[0][1] += a0 * b1;
-            acc[1][0] += a1 * b0;
-            acc[1][1] += a1 * b1;
-        }
-
-        __syncthreads();
-    }
-
-    for (int i = 0; i < kThreadRows; ++i) {
-        const int out_row = out_row0 + i;
-        if (out_row >= M) {
-            continue;
-        }
-        for (int j = 0; j < kThreadCols; ++j) {
-            const int out_col = out_col0 + j;
-            if (out_col < N) {
-                Cn[out_row * N + out_col] = acc[i][j];
-            }
-        }
-    }
-}
-
-template <bool TRANS_A, bool TRANS_B>
-static void launch_bmm_i32_kernel(
-    const int32_t* A,
-    const int32_t* B,
-    int32_t* C,
-    int batch,
-    int M,
-    int N,
-    int K)
-{
-    if (batch <= 0 || M <= 0 || N <= 0 || K <= 0) {
-        return;
-    }
-
-    dim3 block(kBlockCols / kThreadCols, kBlockRows / kThreadRows);
-    const int tiles_m = (M + kBlockRows - 1) / kBlockRows;
-    const int tiles_n = (N + kBlockCols - 1) / kBlockCols;
-    const size_t total_tiles = static_cast<size_t>(batch) * tiles_m * tiles_n;
-    constexpr unsigned int kMaxGridX = 0x7fffffffu;
-
-    for (size_t tile_offset = 0; tile_offset < total_tiles; ) {
-        const size_t remaining_tiles = total_tiles - tile_offset;
-        const unsigned int grid_x =
-            remaining_tiles > static_cast<size_t>(kMaxGridX)
-                ? kMaxGridX
-                : static_cast<unsigned int>(remaining_tiles);
-        dim3 grid(grid_x, 1, 1);
-        bmm_tiled_i32_kernel<TRANS_A, TRANS_B><<<grid, block>>>(
+        bmm_tiled_kernel<T, TRANS_A, TRANS_B, ACCUM><<<grid, block, 0, stream>>>(
             A, B, C, batch, M, N, K, tiles_m, tiles_n, tile_offset);
         tile_offset += grid_x;
     }
@@ -540,7 +412,8 @@ static void bmm_matmul_impl(
     const float* A, const float* B, float* C,
     int batch, int M, int N, int K,
     int trans_a, int trans_b,
-    bool accumulate)
+    bool accumulate,
+    cudaStream_t stream)
 {
     if (batch <= 0 || M <= 0 || N <= 0 || K <= 0) {
         return;
@@ -554,15 +427,17 @@ static void bmm_matmul_impl(
     // Prefer cuBLASLt for transpose-A weight-gradient-like shapes. It handles
     // small-output / large-reduction GEMMs much better on modern GPUs and may
     // internally choose split-K style algorithms.
-    if (transpose_a && !transpose_b &&
+    if (!accumulate &&
+        transpose_a && !transpose_b &&
         K >= kCublasTransposeAPathMinK &&
-        launch_cublaslt_transpose_a_path(A, B, C, batch, M, N, K, accumulate)) {
+        launch_cublaslt_transpose_a_path(A, B, C, batch, M, N, K, accumulate, stream)) {
         return;
     }
 
-    if (transpose_a && !transpose_b &&
+    if (!accumulate &&
+        transpose_a && !transpose_b &&
         K >= kCublasTransposeAPathMinK &&
-        launch_cublas_transpose_a_path(A, B, C, batch, M, N, K, accumulate)) {
+        launch_cublas_transpose_a_path(A, B, C, batch, M, N, K, accumulate, stream)) {
         return;
     }
 
@@ -571,46 +446,48 @@ static void bmm_matmul_impl(
     // so small kernels (1x1/3x3) and larger receptive fields both use a
     // vendor GEMM instead of the slower fallback.
     if (!transpose_a && transpose_b &&
-        launch_cublas_transpose_b_path(A, B, C, batch, M, N, K, accumulate)) {
+        launch_cublas_transpose_b_path(A, B, C, batch, M, N, K, accumulate, stream)) {
         return;
     }
 
     if (!transpose_a && !transpose_b) {
-        if (accumulate) launch_bmm_kernel<false, false, true>(A, B, C, batch, M, N, K);
-        else launch_bmm_kernel<false, false, false>(A, B, C, batch, M, N, K);
+        if (accumulate) launch_bmm_kernel<float, false, false, true>(A, B, C, batch, M, N, K, stream);
+        else launch_bmm_kernel<float, false, false, false>(A, B, C, batch, M, N, K, stream);
         return;
     }
 
     if (!transpose_a && transpose_b) {
-        if (accumulate) launch_bmm_kernel<false, true, true>(A, B, C, batch, M, N, K);
-        else launch_bmm_kernel<false, true, false>(A, B, C, batch, M, N, K);
+        if (accumulate) launch_bmm_kernel<float, false, true, true>(A, B, C, batch, M, N, K, stream);
+        else launch_bmm_kernel<float, false, true, false>(A, B, C, batch, M, N, K, stream);
         return;
     }
 
     if (transpose_a && !transpose_b) {
-        if (accumulate) launch_bmm_kernel<true, false, true>(A, B, C, batch, M, N, K);
-        else launch_bmm_kernel<true, false, false>(A, B, C, batch, M, N, K);
+        if (accumulate) launch_bmm_kernel<float, true, false, true>(A, B, C, batch, M, N, K, stream);
+        else launch_bmm_kernel<float, true, false, false>(A, B, C, batch, M, N, K, stream);
         return;
     }
 
-    if (accumulate) launch_bmm_kernel<true, true, true>(A, B, C, batch, M, N, K);
-    else launch_bmm_kernel<true, true, false>(A, B, C, batch, M, N, K);
+    if (accumulate) launch_bmm_kernel<float, true, true, true>(A, B, C, batch, M, N, K, stream);
+    else launch_bmm_kernel<float, true, true, false>(A, B, C, batch, M, N, K, stream);
 }
 
 extern "C" void bmm_matmul(
     const float* A, const float* B, float* C,
     int batch, int M, int N, int K,
-    int trans_a, int trans_b)
+    int trans_a, int trans_b,
+    cudaStream_t stream)
 {
-    bmm_matmul_impl(A, B, C, batch, M, N, K, trans_a, trans_b, false);
+    bmm_matmul_impl(A, B, C, batch, M, N, K, trans_a, trans_b, false, stream);
 }
 
 extern "C" void bmm_matmul_accum(
     const float* A, const float* B, float* C,
     int batch, int M, int N, int K,
-    int trans_a, int trans_b)
+    int trans_a, int trans_b,
+    cudaStream_t stream)
 {
-    bmm_matmul_impl(A, B, C, batch, M, N, K, trans_a, trans_b, true);
+    bmm_matmul_impl(A, B, C, batch, M, N, K, trans_a, trans_b, true, stream);
 }
 
 extern "C" void bmm_matmul_i32(
@@ -626,21 +503,21 @@ extern "C" void bmm_matmul_i32(
     const bool transpose_b = trans_b != 0;
 
     if (!transpose_a && !transpose_b) {
-        launch_bmm_i32_kernel<false, false>(A, B, C, batch, M, N, K);
+        launch_bmm_kernel<int32_t, false, false, false>(A, B, C, batch, M, N, K, nullptr);
         return;
     }
 
     if (!transpose_a && transpose_b) {
-        launch_bmm_i32_kernel<false, true>(A, B, C, batch, M, N, K);
+        launch_bmm_kernel<int32_t, false, true, false>(A, B, C, batch, M, N, K, nullptr);
         return;
     }
 
     if (transpose_a && !transpose_b) {
-        launch_bmm_i32_kernel<true, false>(A, B, C, batch, M, N, K);
+        launch_bmm_kernel<int32_t, true, false, false>(A, B, C, batch, M, N, K, nullptr);
         return;
     }
 
-    launch_bmm_i32_kernel<true, true>(A, B, C, batch, M, N, K);
+    launch_bmm_kernel<int32_t, true, true, false>(A, B, C, batch, M, N, K, nullptr);
 }
 
 extern "C" void bmm_fprop(

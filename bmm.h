@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cuda_runtime_api.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,12 +37,14 @@ enum BmmTranspose {
 void bmm_matmul(
     const float* A, const float* B, float* C,
     int batch, int M, int N, int K,
-    int trans_a, int trans_b);
+    int trans_a, int trans_b,
+    cudaStream_t stream = nullptr);
 
 void bmm_matmul_accum(
     const float* A, const float* B, float* C,
     int batch, int M, int N, int K,
-    int trans_a, int trans_b);
+    int trans_a, int trans_b,
+    cudaStream_t stream = nullptr);
 
 /*
  * Batched Matrix Multiplication layer compatibility API.
