@@ -36,26 +36,9 @@ inline int32_t centered_weight_value(const FilterKRSC& w,
 }
 
 template <nnalgebra::DataType Tin>
-inline int32_t centered_weight_value(const FilterKRSC& w,
-                                     int k, int r, int s, int c, int ay, int ax,
-                                     const nnalgebra::QuantizationParameters<Tin>* f_qp) {
-  return static_cast<int32_t>(w.data[idx_krsc(k, r, s, c, ay, ax, w.r, w.s, w.cin_per_group, w.ay, w.ax)]) -
-         nnalgebra::getZeroPoint(*f_qp);
-}
-
-template <nnalgebra::DataType Tin>
 inline int32_t centered_block_weight_value(const BlockFilterKByBxRSC& w,
                                            int k, int by, int bx, int r, int s, int c,
                                            int ay, int ax,
-                                           const nnalgebra::QuantizationParameters<Tin>* f_qp) {
-  return static_cast<int32_t>(w.data[idx_kbybxrsc(k, by, bx, r, s, c, ay, ax,
-                                                  w.by, w.bx, w.r, w.s, w.cin_per_group, w.ay, w.ax)]) -
-         nnalgebra::getZeroPoint(*f_qp);
-}
-
-template <nnalgebra::DataType Tin>
-inline int32_t centered_block_weight_value(const BlockFilterKByBxRSC& w,
-                                           int k, int by, int bx, int r, int s, int c, int ay, int ax,
                                            const nnalgebra::QuantizationParameters<Tin>* f_qp) {
   return static_cast<int32_t>(w.data[idx_kbybxrsc(k, by, bx, r, s, c, ay, ax,
                                                   w.by, w.bx, w.r, w.s, w.cin_per_group, w.ay, w.ax)]) -

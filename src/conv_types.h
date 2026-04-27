@@ -96,11 +96,7 @@ struct BlockFilterKByBxRSC {
   const float* ptr() const { return data.data(); }
 };
 
-// Logical LinQuantI32 accumulator values are stored in float buffers so the
-// quantized path can reuse the tiled float GEMM implementation. Callers should
-// still treat these values as integer-domain accumulators paired with
-// LinQuantI32 quantization parameters.
-using QuantizedAccumStorage = float;
+using QuantizedAccumStorage = int32_t;
 
 struct TensorNHWCI32 {
   int n = 0;

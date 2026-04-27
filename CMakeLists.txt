@@ -187,6 +187,27 @@ if(ENABLE_CUDNN)
     target_compile_definitions(conv_bench PRIVATE USE_CUDNN=1)
     target_include_directories(conv_bench PRIVATE ${CUDNN_INCLUDE_DIR})
     target_link_libraries(conv_bench PRIVATE ${CUDNN_LIBRARY})
+
+    if(WIN32)
+      get_filename_component(CUDNN_INCLUDE_PARENT "${CUDNN_INCLUDE_DIR}" DIRECTORY)
+      get_filename_component(CUDNN_ROOT_DIR "${CUDNN_INCLUDE_PARENT}" DIRECTORY)
+      set(CUDNN_BIN_DIR_CANDIDATES
+        "${CUDNN_ROOT_DIR}/bin/${CUDAToolkit_VERSION_MAJOR}.${CUDAToolkit_VERSION_MINOR}/x64"
+        "${CUDNN_ROOT_DIR}/bin/12.9/x64"
+        "${CUDNN_ROOT_DIR}/bin/13.1/x64"
+      )
+      foreach(_bin_dir IN LISTS CUDNN_BIN_DIR_CANDIDATES)
+        if(EXISTS "${_bin_dir}/cudnn64_9.dll")
+          add_custom_command(TARGET conv_bench POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+              "${_bin_dir}"
+              $<TARGET_FILE_DIR:conv_bench>
+          )
+          break()
+        endif()
+      endforeach()
+    endif()
+
     message(STATUS "cuDNN found: ${CUDNN_LIBRARY}")
   else()
     message(STATUS "cuDNN not found; build without cuDNN support")

@@ -82,10 +82,11 @@ struct Workspace {
   }
 };
 
-void ensure_capacity(float** ptr, size_t* cap, size_t elements) {
+template <typename T>
+void ensure_capacity(T** ptr, size_t* cap, size_t elements) {
   if (*cap >= elements) return;
   if (*ptr) CUDA_CHECK(cudaFree(*ptr));
-  CUDA_CHECK(cudaMalloc(ptr, elements * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(ptr), elements * sizeof(T)));
   *cap = elements;
 }
 
@@ -3226,6 +3227,18 @@ struct QuantizedWorkspace {
   }
 };
 
+int choose_quant_rows_per_chunk(int rows_total, int kdim, int ncol) {
+  if (rows_total <= 0) return 1;
+  const size_t bytes_per_row =
+      static_cast<size_t>(kdim + ncol) * sizeof(QuantizedAccumStorage);
+  if (bytes_per_row == 0) return rows_total;
+  constexpr size_t kChunkBytesBudget = 128ull * 1024ull * 1024ull;
+  size_t rows = kChunkBytesBudget / bytes_per_row;
+  if (rows == 0) rows = 1;
+  if (rows > static_cast<size_t>(rows_total)) rows = static_cast<size_t>(rows_total);
+  return static_cast<int>(rows);
+}
+
 template <nnalgebra::DataType Tin>
 __global__ void im2col_nhwc_qi32_kernel(const float* __restrict__ x,
                                         QuantizedAccumStorage* __restrict__ col,
@@ -3565,31 +3578,19 @@ void launch_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, QuantizedAc
   const int m = n * sh.base_ho * sh.base_wo;
   const int kdim = r * s * sh.cin_group;
   const int ncol = sh.kout_group * p.ay * p.ax;
+  const int rows_per_chunk = choose_quant_rows_per_chunk(m, kdim, ncol);
   const int t = 256;
 
   QuantizedWorkspace ws;
-  ensure_capacity(&ws.d_col, &ws.d_col_cap, static_cast<size_t>(m) * kdim);
+  ensure_capacity(&ws.d_col, &ws.d_col_cap, static_cast<size_t>(rows_per_chunk) * kdim);
   ensure_capacity(&ws.d_wg, &ws.d_wg_cap, static_cast<size_t>(kdim) * ncol);
-  ensure_capacity(&ws.d_ymat, &ws.d_ymat_cap, static_cast<size_t>(m) * ncol);
+  ensure_capacity(&ws.d_ymat, &ws.d_ymat_cap, static_cast<size_t>(rows_per_chunk) * ncol);
 
   CUDA_CHECK(cudaMemset(d_y, 0, static_cast<size_t>(n) * sh.ho * sh.wo * k * sizeof(QuantizedAccumStorage)));
 
   for (int g = 0; g < p.groups; ++g) {
     const int cin_base = g * sh.cin_group;
     const int kout_base = g * sh.kout_group;
-
-    const int total_col = m * kdim;
-    const int blocks_col = (total_col + t - 1) / t;
-    im2col_nhwc_rows_typed_kernel<int32_t, nnalgebra::QuantizationParameters<Tin>><<<blocks_col, t>>>(d_x, ws.d_col,
-                                                                                                       n, h, w, c,
-                                                                                                       sh.base_ho, sh.base_wo,
-                                                                                                       0, m,
-                                                                                                       r, s,
-                                                                                                       p.pad_h, p.pad_w,
-                                                                                                       p.stride_h, p.stride_w,
-                                                                                                       p.dilation_h, p.dilation_w,
-                                                                                                       cin_base, sh.cin_group,
-                                                                                                       in_qp);
 
     const int total_wg = kdim * ncol;
     const int blocks_wg = (total_wg + t - 1) / t;
@@ -3599,15 +3600,32 @@ void launch_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, QuantizedAc
                                                                                                              kout_base, sh.kout_group,
                                                                                                              f_qp);
 
-    bmm_matmul_i32(ws.d_col, ws.d_wg, ws.d_ymat, 1, m, ncol, kdim,
-                   BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_YES);
+    for (int row_start = 0; row_start < m; row_start += rows_per_chunk) {
+      const int row_count = std::min(rows_per_chunk, m - row_start);
 
-    const int total_ym = m * ncol;
-    const int blocks_ym = (total_ym + t - 1) / t;
-    unpack_matrix_to_nhwc_group_app_rows_typed_kernel<int32_t><<<blocks_ym, t>>>(ws.d_ymat, d_y,
-                                                                                  n, sh.base_ho, sh.base_wo, p.ay, p.ax,
-                                                                                  0, m,
-                                                                                  k, kout_base, sh.kout_group);
+      const int total_col = row_count * kdim;
+      const int blocks_col = (total_col + t - 1) / t;
+      im2col_nhwc_rows_typed_kernel<int32_t, nnalgebra::QuantizationParameters<Tin>><<<blocks_col, t>>>(d_x, ws.d_col,
+                                                                                                         n, h, w, c,
+                                                                                                         sh.base_ho, sh.base_wo,
+                                                                                                         row_start, row_count,
+                                                                                                         r, s,
+                                                                                                         p.pad_h, p.pad_w,
+                                                                                                         p.stride_h, p.stride_w,
+                                                                                                         p.dilation_h, p.dilation_w,
+                                                                                                         cin_base, sh.cin_group,
+                                                                                                         in_qp);
+
+      bmm_matmul_i32(ws.d_col, ws.d_wg, ws.d_ymat, 1, row_count, ncol, kdim,
+                     BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_YES);
+
+      const int total_ym = row_count * ncol;
+      const int blocks_ym = (total_ym + t - 1) / t;
+      unpack_matrix_to_nhwc_group_app_rows_typed_kernel<int32_t><<<blocks_ym, t>>>(ws.d_ymat, d_y,
+                                                                                    n, sh.base_ho, sh.base_wo, p.ay, p.ax,
+                                                                                    row_start, row_count,
+                                                                                    k, kout_base, sh.kout_group);
+    }
   }
 
   if (out_qp) {
@@ -3632,12 +3650,13 @@ void launch_block_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, Quant
   const int m_block = n * sh.block_ho * sh.block_wo;
   const int kdim = r * s * sh.base.cin_group;
   const int ncol = sh.base.kout_group * p.conv.ay * p.conv.ax;
+  const int rows_per_chunk = choose_quant_rows_per_chunk(m_block, kdim, ncol);
   const int t = 256;
 
   QuantizedWorkspace ws;
-  ensure_capacity(&ws.d_col, &ws.d_col_cap, static_cast<size_t>(m_block) * kdim);
+  ensure_capacity(&ws.d_col, &ws.d_col_cap, static_cast<size_t>(rows_per_chunk) * kdim);
   ensure_capacity(&ws.d_wg, &ws.d_wg_cap, static_cast<size_t>(kdim) * ncol);
-  ensure_capacity(&ws.d_ymat, &ws.d_ymat_cap, static_cast<size_t>(m_block) * ncol);
+  ensure_capacity(&ws.d_ymat, &ws.d_ymat_cap, static_cast<size_t>(rows_per_chunk) * ncol);
 
   CUDA_CHECK(cudaMemset(d_y, 0, static_cast<size_t>(n) * sh.base.ho * sh.base.wo * k * sizeof(QuantizedAccumStorage)));
 
@@ -3649,20 +3668,6 @@ void launch_block_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, Quant
       for (int bx = 0; bx < p.block_bx; ++bx) {
         const int wo_start_base = bx * sh.block_wo;
 
-        const int total_col = m_block * kdim;
-        const int blocks_col = (total_col + t - 1) / t;
-        im2col_nhwc_block_rows_typed_kernel<int32_t, nnalgebra::QuantizationParameters<Tin>><<<blocks_col, t>>>(d_x, ws.d_col,
-                                                                                                                  n, h, w, c,
-                                                                                                                  ho_start, wo_start,
-                                                                                                                  sh.block_ho, sh.block_wo,
-                                                                                                                  0, m_block,
-                                                                                                                  r, s,
-                                                                                                                  p.conv.pad_h, p.conv.pad_w,
-                                                                                                                  p.conv.stride_h, p.conv.stride_w,
-                                                                                                                  p.conv.dilation_h, p.conv.dilation_w,
-                                                                                                                  cin_base, sh.base.cin_group,
-                                                                                                                  in_qp);
-
         const int total_wg = kdim * ncol;
         const int blocks_wg = (total_wg + t - 1) / t;
         pack_block_filter_kbybxrsc_group_typed_kernel<int32_t, nnalgebra::QuantizationParameters<Tin>><<<blocks_wg, t>>>(d_w, ws.d_wg,
@@ -3673,18 +3678,36 @@ void launch_block_fprop_nhwc_qi32_impl(const float* d_x, const float* d_w, Quant
                                                                                                                            kout_base, sh.base.kout_group,
                                                                                                                            f_qp);
 
-        bmm_matmul_i32(ws.d_col, ws.d_wg, ws.d_ymat, 1, m_block, ncol, kdim,
-                       BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_YES);
+        for (int row_start = 0; row_start < m_block; row_start += rows_per_chunk) {
+          const int row_count = std::min(rows_per_chunk, m_block - row_start);
 
-        const int total_ym = m_block * ncol;
-        const int blocks_ym = (total_ym + t - 1) / t;
-        unpack_matrix_to_nhwc_group_app_block_rows_typed_kernel<int32_t><<<blocks_ym, t>>>(ws.d_ymat, d_y,
-                                                                                             n, sh.base.base_ho, sh.base.base_wo, k,
-                                                                                             ho_start, wo_start,
-                                                                                             sh.block_ho, sh.block_wo,
-                                                                                             p.conv.ay, p.conv.ax,
-                                                                                             0, m_block,
-                                                                                             kout_base, sh.base.kout_group);
+          const int total_col = row_count * kdim;
+          const int blocks_col = (total_col + t - 1) / t;
+          im2col_nhwc_block_rows_typed_kernel<int32_t, nnalgebra::QuantizationParameters<Tin>><<<blocks_col, t>>>(d_x, ws.d_col,
+                                                                                                                    n, h, w, c,
+                                                                                                                    ho_start_base, wo_start_base,
+                                                                                                                    sh.block_ho, sh.block_wo,
+                                                                                                                    row_start, row_count,
+                                                                                                                    r, s,
+                                                                                                                    p.conv.pad_h, p.conv.pad_w,
+                                                                                                                    p.conv.stride_h, p.conv.stride_w,
+                                                                                                                    p.conv.dilation_h, p.conv.dilation_w,
+                                                                                                                    cin_base, sh.base.cin_group,
+                                                                                                                    in_qp);
+
+          bmm_matmul_i32(ws.d_col, ws.d_wg, ws.d_ymat, 1, row_count, ncol, kdim,
+                         BMM_TRANSPOSE_NONE, BMM_TRANSPOSE_YES);
+
+          const int total_ym = row_count * ncol;
+          const int blocks_ym = (total_ym + t - 1) / t;
+          unpack_matrix_to_nhwc_group_app_block_rows_typed_kernel<int32_t><<<blocks_ym, t>>>(ws.d_ymat, d_y,
+                                                                                               n, sh.base.base_ho, sh.base.base_wo, k,
+                                                                                               ho_start_base, wo_start_base,
+                                                                                               sh.block_ho, sh.block_wo,
+                                                                                               p.conv.ay, p.conv.ax,
+                                                                                               row_start, row_count,
+                                                                                               kout_base, sh.base.kout_group);
+        }
       }
     }
   }

@@ -96,7 +96,7 @@ void bmm_bprop(
 
 #ifdef __cplusplus
 void bmm_matmul_i32(
-    const float* A, const float* B, float* C,
+    const int32_t* A, const int32_t* B, int32_t* C,
     int batch, int M, int N, int K,
     int trans_a, int trans_b);
 #endif

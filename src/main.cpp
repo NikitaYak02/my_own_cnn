@@ -533,7 +533,11 @@ int main(int argc, char** argv) {
     // Default to strict FP32 numerics unless the user explicitly overrides it
     // in the environment.
     if (std::getenv("NVIDIA_TF32_OVERRIDE") == nullptr) {
+#ifdef _WIN32
+      _putenv_s("NVIDIA_TF32_OVERRIDE", "0");
+#else
       setenv("NVIDIA_TF32_OVERRIDE", "0", 0);
+#endif
     }
 
     const Options o = parse_args(argc, argv);

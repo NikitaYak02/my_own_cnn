@@ -113,7 +113,7 @@ std::vector<float> run_block_bprop_pass(const TensorNHWC& x_shape,
 
 int main() {
   try {
-    constexpr int n = 250;
+    int n = 250;
     constexpr int h = 128;
     constexpr int w = 128;
     constexpr int c = 1;
@@ -129,6 +129,19 @@ int main() {
     p.dilation_h = 1;
     p.dilation_w = 1;
     p.groups = 1;
+
+    // Keep the test meaningful while adapting to the GPU memory available on CI/dev machines.
+    size_t free_mem = 0;
+    size_t total_mem = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
+    const size_t m_per_batch = static_cast<size_t>(h) * static_cast<size_t>(w);
+    const size_t per_batch_workspace_bytes =
+        m_per_batch * (static_cast<size_t>(r) * static_cast<size_t>(s) * static_cast<size_t>(c) +
+                       static_cast<size_t>(k)) * sizeof(float);
+    const size_t workspace_budget = free_mem / 4;
+    const int n_from_budget =
+        static_cast<int>(std::max<size_t>(1, workspace_budget / std::max<size_t>(1, per_batch_workspace_bytes)));
+    n = std::max(8, std::min(n, n_from_budget));
 
     TensorNHWC x(n, h, w, c);
     FilterKRSC w_filter(r, s, c, k);
