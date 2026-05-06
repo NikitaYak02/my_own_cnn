@@ -67,12 +67,40 @@ std::vector<float> run_fprop_pass(const TensorNHWC& y_shape,
   return y;
 }
 
+std::vector<float> run_fprop_local_pass(const TensorNHWC& y_shape,
+                                        DeviceBuffers& dev,
+                                        const Conv2DParams& p,
+                                        int n, int h, int w, int c, int r, int s, int k) {
+  CUDA_CHECK(cudaMemset(dev.d_y, 0, y_shape.elements() * sizeof(float)));
+  launch_fprop_nhwc_local(dev.d_x, dev.d_w, dev.d_y, n, h, w, c, r, s, k, p);
+  CUDA_CHECK(cudaPeekAtLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  std::vector<float> y(y_shape.elements());
+  CUDA_CHECK(cudaMemcpy(y.data(), dev.d_y, y.size() * sizeof(float), cudaMemcpyDeviceToHost));
+  return y;
+}
+
 std::vector<float> run_bprop_pass(const TensorNHWC& x_shape,
                                   DeviceBuffers& dev,
                                   const Conv2DParams& p,
                                   int n, int h, int w, int c, int r, int s, int k) {
   CUDA_CHECK(cudaMemset(dev.d_dx, 0, x_shape.elements() * sizeof(float)));
   launch_bprop_nhwc(dev.d_dy, dev.d_w, dev.d_dx, n, h, w, c, r, s, k, p);
+  CUDA_CHECK(cudaPeekAtLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  std::vector<float> dx(x_shape.elements());
+  CUDA_CHECK(cudaMemcpy(dx.data(), dev.d_dx, dx.size() * sizeof(float), cudaMemcpyDeviceToHost));
+  return dx;
+}
+
+std::vector<float> run_bprop_local_pass(const TensorNHWC& x_shape,
+                                        DeviceBuffers& dev,
+                                        const Conv2DParams& p,
+                                        int n, int h, int w, int c, int r, int s, int k) {
+  CUDA_CHECK(cudaMemset(dev.d_dx, 0, x_shape.elements() * sizeof(float)));
+  launch_bprop_nhwc_local(dev.d_dy, dev.d_w, dev.d_dx, n, h, w, c, r, s, k, p);
   CUDA_CHECK(cudaPeekAtLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -176,6 +204,14 @@ int main() {
       throw std::runtime_error("fprop output is unexpectedly all zeros");
     }
 
+    const std::vector<float> y_local = run_fprop_local_pass(y_shape, dev, p, n, h, w, c, r, s, k);
+    const float y_local_diff = max_abs_diff(y_pass1, y_local);
+    if (y_local_diff > 1e-3f) {
+      std::ostringstream oss;
+      oss << "local fprop mismatch detected: max_abs_diff=" << y_local_diff;
+      throw std::runtime_error(oss.str());
+    }
+
     const std::vector<float> dx_pass1 = run_bprop_pass(x, dev, p, n, h, w, c, r, s, k);
     const std::vector<float> dx_pass2 = run_bprop_pass(x, dev, p, n, h, w, c, r, s, k);
     const float dx_replay_diff = max_abs_diff(dx_pass1, dx_pass2);
@@ -186,6 +222,14 @@ int main() {
     }
     if (sum_abs(dx_pass1) == 0.0f) {
       throw std::runtime_error("bprop output is unexpectedly all zeros");
+    }
+
+    const std::vector<float> dx_local = run_bprop_local_pass(x, dev, p, n, h, w, c, r, s, k);
+    const float dx_local_diff = max_abs_diff(dx_pass1, dx_local);
+    if (dx_local_diff > 1e-3f) {
+      std::ostringstream oss;
+      oss << "local bprop mismatch detected: max_abs_diff=" << dx_local_diff;
+      throw std::runtime_error(oss.str());
     }
 
     BlockConv2DParams block_p;
@@ -233,7 +277,9 @@ int main() {
     std::cout << "conv_large_workspace_test passed\n";
     std::cout << "case=n250_h128_w128_c1_k16_r11_s11 pad=5 stride=1\n";
     std::cout << "fprop_replay_diff=" << y_replay_diff << "\n";
+    std::cout << "local_fprop_diff=" << y_local_diff << "\n";
     std::cout << "bprop_replay_diff=" << dx_replay_diff << "\n";
+    std::cout << "local_bprop_diff=" << dx_local_diff << "\n";
     std::cout << "block_fprop_replay_diff=" << block_y_replay_diff << "\n";
     std::cout << "block_bprop_replay_diff=" << block_dx_replay_diff << "\n";
     return 0;

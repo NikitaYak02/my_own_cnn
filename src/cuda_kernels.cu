@@ -3,6 +3,7 @@
 #include "bmm.h"
 
 #include <algorithm>
+#include <cstring>
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <functional>
@@ -126,6 +127,27 @@ bool implicit_pointwise_enabled() {
   return !(disable && disable[0] != '\0' && disable[0] != '0');
 }
 
+bool local_fprop_nhwc_enabled() {
+  const char* algo = std::getenv("CONV_FPROP_NHWC_ALGO");
+  return algo && (std::strcmp(algo, "local") == 0 ||
+                  std::strcmp(algo, "shared") == 0 ||
+                  std::strcmp(algo, "local_shared") == 0);
+}
+
+bool local_bprop_nhwc_enabled() {
+  const char* algo = std::getenv("CONV_BPROP_NHWC_ALGO");
+  return algo && (std::strcmp(algo, "local") == 0 ||
+                  std::strcmp(algo, "shared") == 0 ||
+                  std::strcmp(algo, "local_shared") == 0);
+}
+
+bool local_grad_nhwc_enabled() {
+  const char* algo = std::getenv("CONV_GRAD_NHWC_ALGO");
+  return algo && (std::strcmp(algo, "local") == 0 ||
+                  std::strcmp(algo, "shared") == 0 ||
+                  std::strcmp(algo, "local_shared") == 0);
+}
+
 bool should_prefer_deterministic_grad(int rows_total, int kdim, int ncol, int groups) {
   if (groups >= 16) return true;
   if (kdim <= 64 && ncol <= 64 && rows_total >= 4096) return true;
@@ -161,6 +183,10 @@ constexpr int kGradSplitKOutputsPerWarp = 4;
 constexpr int kGradTileRows = 64;
 constexpr int kGradTileKDim = 8;
 constexpr int kGradTileKOut = 8;
+constexpr int kLocalFpropImgBlock = 16;
+constexpr int kLocalFpropKBlock = 8;
+constexpr int kLocalFpropKTile = 64;
+constexpr int kLocalGradBlockSize = 256;
 
 __device__ __forceinline__ float warp_reduce_sum(float v) {
   for (int offset = kGradSplitKWarpSize / 2; offset > 0; offset >>= 1) {
@@ -214,6 +240,232 @@ __global__ void add_bias_nhwc_kernel(float* __restrict__ y,
     bias_idx = (ko * ay + ay_idx) * ax + ax_idx;
   }
   y[idx] += bias[bias_idx];
+}
+
+__global__ void local_fprop_nhwc_shared_kernel(const float* __restrict__ x,
+                                               const float* __restrict__ wgt,
+                                               float* __restrict__ y,
+                                               int n, int h, int w, int c,
+                                               int base_ho, int base_wo,
+                                               int r, int s, int k,
+                                               int pad_h, int pad_w,
+                                               int stride_h, int stride_w,
+                                               int dilation_h, int dilation_w,
+                                               int groups, int cin_group,
+                                               int kout_group,
+                                               int ay, int ax) {
+  extern __shared__ float sh[];
+  float* sh_in = sh;
+  float* sh_w = sh_in + kLocalFpropImgBlock * kLocalFpropKTile;
+
+  const int tid = threadIdx.x;
+  const int nt = blockDim.x;
+  const int base_pos = blockIdx.x;
+  const int group = blockIdx.y / ((kout_group + kLocalFpropKBlock - 1) / kLocalFpropKBlock);
+  const int k_block_idx = blockIdx.y - group * ((kout_group + kLocalFpropKBlock - 1) / kLocalFpropKBlock);
+  const int n_start = blockIdx.z * kLocalFpropImgBlock;
+  const int img_count = min(kLocalFpropImgBlock, n - n_start);
+  if (img_count <= 0) return;
+
+  const int ho_base = base_pos / base_wo;
+  const int wo_base = base_pos - ho_base * base_wo;
+  const int k_start = group * kout_group + k_block_idx * kLocalFpropKBlock;
+  const int k_count = min(kLocalFpropKBlock, group * kout_group + kout_group - k_start);
+  if (k_count <= 0) return;
+
+  const int app = ay * ax;
+  const int ncol = k_count * app;
+  const int kdim = r * s * cin_group;
+  const int cin_base = group * cin_group;
+
+  for (int out_base = 0; out_base < img_count * ncol; out_base += nt) {
+    const int out_idx = out_base + tid;
+    const bool valid_out = out_idx < img_count * ncol;
+    const int n_local = out_idx / ncol;
+    const int col_ext = out_idx - n_local * ncol;
+    const int ko_local = col_ext / app;
+    const int app_rem = col_ext - ko_local * app;
+    const int ay_idx = app_rem / ax;
+    const int ax_idx = app_rem - ay_idx * ax;
+
+    float accum = 0.0f;
+    for (int kt_start = 0; kt_start < kdim; kt_start += kLocalFpropKTile) {
+      const int kt_count = min(kLocalFpropKTile, kdim - kt_start);
+
+      for (int load_idx = tid; load_idx < img_count * kt_count; load_idx += nt) {
+        const int n_load_local = load_idx / kt_count;
+        const int k_local = load_idx - n_load_local * kt_count;
+        const int kd = kt_start + k_local;
+        int rr, ss, ci;
+        decode_kdim_index(kd, s, cin_group, rr, ss, ci);
+
+        const int hi = ho_base * stride_h - pad_h + rr * dilation_h;
+        const int wi = wo_base * stride_w - pad_w + ss * dilation_w;
+        float v = 0.0f;
+        if (hi >= 0 && hi < h && wi >= 0 && wi < w) {
+          v = x[idx_nhwc(n_start + n_load_local, hi, wi, cin_base + ci, h, w, c)];
+        }
+        sh_in[n_load_local * kLocalFpropKTile + k_local] = v;
+      }
+
+      for (int load_idx = tid; load_idx < ncol * kt_count; load_idx += nt) {
+        const int col_load = load_idx / kt_count;
+        const int k_local = load_idx - col_load * kt_count;
+        const int kd = kt_start + k_local;
+        const int ko_load_local = col_load / app;
+        const int app_load_rem = col_load - ko_load_local * app;
+        const int ay_load = app_load_rem / ax;
+        const int ax_load = app_load_rem - ay_load * ax;
+        int rr, ss, ci;
+        decode_kdim_index(kd, s, cin_group, rr, ss, ci);
+
+        sh_w[col_load * kLocalFpropKTile + k_local] =
+            wgt[idx_krsc(k_start + ko_load_local, rr, ss, ci, ay_load, ax_load,
+                         r, s, cin_group, ay, ax)];
+      }
+
+      __syncthreads();
+      if (valid_out) {
+        for (int kd = 0; kd < kt_count; ++kd) {
+          accum += sh_in[n_local * kLocalFpropKTile + kd] *
+                   sh_w[col_ext * kLocalFpropKTile + kd];
+        }
+      }
+      __syncthreads();
+    }
+
+    if (valid_out) {
+      y[idx_nhwc(n_start + n_local,
+                 ho_base * ay + ay_idx,
+                 wo_base * ax + ax_idx,
+                 k_start + ko_local,
+                 base_ho * ay, base_wo * ax, k)] = accum;
+    }
+  }
+}
+
+__global__ void local_bprop_nhwc_kernel(const float* __restrict__ dy,
+                                        const float* __restrict__ wgt,
+                                        float* __restrict__ dx,
+                                        int n, int h, int w, int c,
+                                        int base_ho, int base_wo,
+                                        int r, int s, int k,
+                                        int pad_h, int pad_w,
+                                        int stride_h, int stride_w,
+                                        int dilation_h, int dilation_w,
+                                        int groups, int cin_group,
+                                        int kout_group,
+                                        int ay, int ax) {
+  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t total = static_cast<size_t>(n) * h * w * c;
+  if (idx >= total) return;
+
+  const int ci_global = static_cast<int>(idx % c);
+  const size_t t0 = idx / c;
+  const int wi = static_cast<int>(t0 % w);
+  const size_t t1 = t0 / w;
+  const int hi = static_cast<int>(t1 % h);
+  const int n_idx = static_cast<int>(t1 / h);
+
+  const int group = ci_global / cin_group;
+  const int ci = ci_global - group * cin_group;
+  const int kout_base = group * kout_group;
+  float accum = 0.0f;
+
+  for (int rr = 0; rr < r; ++rr) {
+    const int base_ho_nom = hi + pad_h - rr * dilation_h;
+    if (base_ho_nom < 0 || (base_ho_nom % stride_h) != 0) continue;
+    const int ho_base = base_ho_nom / stride_h;
+    if (ho_base < 0 || ho_base >= base_ho) continue;
+
+    for (int ss = 0; ss < s; ++ss) {
+      const int base_wo_nom = wi + pad_w - ss * dilation_w;
+      if (base_wo_nom < 0 || (base_wo_nom % stride_w) != 0) continue;
+      const int wo_base = base_wo_nom / stride_w;
+      if (wo_base < 0 || wo_base >= base_wo) continue;
+
+      for (int ko = 0; ko < kout_group; ++ko) {
+        for (int ay_idx = 0; ay_idx < ay; ++ay_idx) {
+          const int ho = ho_base * ay + ay_idx;
+          for (int ax_idx = 0; ax_idx < ax; ++ax_idx) {
+            const int wo = wo_base * ax + ax_idx;
+            const float dyv = dy[idx_nhwc(n_idx, ho, wo, kout_base + ko,
+                                          base_ho * ay, base_wo * ax, k)];
+            const float wv = wgt[idx_krsc(kout_base + ko, rr, ss, ci, ay_idx, ax_idx,
+                                          r, s, cin_group, ay, ax)];
+            accum += dyv * wv;
+          }
+        }
+      }
+    }
+  }
+
+  dx[idx] = accum;
+}
+
+__global__ void local_grad_nhwc_kernel(const float* __restrict__ x,
+                                       const float* __restrict__ dy,
+                                       float* __restrict__ dw,
+                                       int n, int h, int w, int c,
+                                       int base_ho, int base_wo,
+                                       int r, int s, int k,
+                                       int pad_h, int pad_w,
+                                       int stride_h, int stride_w,
+                                       int dilation_h, int dilation_w,
+                                       int groups, int cin_group,
+                                       int kout_group,
+                                       int ay, int ax) {
+  extern __shared__ float partials[];
+
+  const int weight_idx = blockIdx.x;
+  const int weights_per_group = r * s * cin_group * kout_group * ay * ax;
+  const int group = weight_idx / weights_per_group;
+  int rem = weight_idx - group * weights_per_group;
+
+  const int ax_idx = rem % ax;
+  rem /= ax;
+  const int ay_idx = rem % ay;
+  rem /= ay;
+  const int ci = rem % cin_group;
+  rem /= cin_group;
+  const int ss = rem % s;
+  rem /= s;
+  const int rr = rem % r;
+  const int ko = rem / r;
+
+  const int cin_base = group * cin_group;
+  const int kout_base = group * kout_group;
+  const int rows = n * base_ho * base_wo;
+
+  float accum = 0.0f;
+  for (int row = threadIdx.x; row < rows; row += blockDim.x) {
+    int n_idx, ho_base, wo_base;
+    decode_conv_row(row, base_ho, base_wo, n_idx, ho_base, wo_base);
+
+    const int hi = ho_base * stride_h - pad_h + rr * dilation_h;
+    const int wi = wo_base * stride_w - pad_w + ss * dilation_w;
+    if (hi >= 0 && hi < h && wi >= 0 && wi < w) {
+      const float xv = x[idx_nhwc(n_idx, hi, wi, cin_base + ci, h, w, c)];
+      const float dyv = dy[idx_nhwc(n_idx, ho_base * ay + ay_idx, wo_base * ax + ax_idx,
+                                    kout_base + ko, base_ho * ay, base_wo * ax, k)];
+      accum += xv * dyv;
+    }
+  }
+
+  partials[threadIdx.x] = accum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      partials[threadIdx.x] += partials[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    dw[idx_krsc(kout_base + ko, rr, ss, ci, ay_idx, ax_idx,
+                r, s, cin_group, ay, ax)] = partials[0];
+  }
 }
 
 __global__ void add_block_bias_nhwc_kernel(float* __restrict__ y,
@@ -2345,8 +2597,46 @@ void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
   launch_fprop_nhwc(d_x, d_w, d_y, make_conv2d_runtime_config(n, h, w, c, w_shape, p));
 }
 
+void launch_fprop_nhwc_local(const float* d_x, const float* d_w, float* d_y,
+                             int n, int h, int w, int c, int r, int s, int k,
+                             const Conv2DParams& p) {
+  const FilterKRSC w_shape(r, s, c / p.groups, k, p.ay, p.ax);
+  launch_fprop_nhwc_local(d_x, d_w, d_y, make_conv2d_runtime_config(n, h, w, c, w_shape, p));
+}
+
+void launch_fprop_nhwc_local(const float* d_x, const float* d_w, float* d_y,
+                             const Conv2DRuntimeConfig& cfg) {
+  const int k_blocks_per_group = (cfg.shape.kout_group + kLocalFpropKBlock - 1) / kLocalFpropKBlock;
+  const dim3 grid(cfg.shape.base_ho * cfg.shape.base_wo,
+                  cfg.params.groups * k_blocks_per_group,
+                  (cfg.n + kLocalFpropImgBlock - 1) / kLocalFpropImgBlock);
+  const dim3 block(128, 1, 1);
+  const size_t shared_size =
+      (static_cast<size_t>(kLocalFpropImgBlock) * kLocalFpropKTile +
+       static_cast<size_t>(kLocalFpropKBlock) * cfg.params.ay * cfg.params.ax * kLocalFpropKTile) *
+      sizeof(float);
+
+  local_fprop_nhwc_shared_kernel<<<grid, block, shared_size>>>(
+      d_x, d_w, d_y,
+      cfg.n, cfg.h, cfg.w, cfg.c,
+      cfg.shape.base_ho, cfg.shape.base_wo,
+      cfg.r, cfg.s, cfg.k,
+      cfg.params.pad_h, cfg.params.pad_w,
+      cfg.params.stride_h, cfg.params.stride_w,
+      cfg.params.dilation_h, cfg.params.dilation_w,
+      cfg.params.groups, cfg.shape.cin_group,
+      cfg.shape.kout_group,
+      cfg.params.ay, cfg.params.ax);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
                        const Conv2DRuntimeConfig& cfg) {
+  if (local_fprop_nhwc_enabled()) {
+    launch_fprop_nhwc_local(d_x, d_w, d_y, cfg);
+    return;
+  }
+
   const int n = cfg.n;
   const int h = cfg.h;
   const int w = cfg.w;
@@ -2496,8 +2786,39 @@ void launch_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
   launch_bprop_nhwc(d_dy, d_w, d_dx, make_conv2d_runtime_config(n, h, w, c, w_shape, p));
 }
 
+void launch_bprop_nhwc_local(const float* d_dy, const float* d_w, float* d_dx,
+                             int n, int h, int w, int c, int r, int s, int k,
+                             const Conv2DParams& p) {
+  const FilterKRSC w_shape(r, s, c / p.groups, k, p.ay, p.ax);
+  launch_bprop_nhwc_local(d_dy, d_w, d_dx, make_conv2d_runtime_config(n, h, w, c, w_shape, p));
+}
+
+void launch_bprop_nhwc_local(const float* d_dy, const float* d_w, float* d_dx,
+                             const Conv2DRuntimeConfig& cfg) {
+  const int t = 256;
+  const size_t total = cfg.input_elements;
+  const int blocks = static_cast<int>((total + t - 1) / t);
+  local_bprop_nhwc_kernel<<<blocks, t>>>(
+      d_dy, d_w, d_dx,
+      cfg.n, cfg.h, cfg.w, cfg.c,
+      cfg.shape.base_ho, cfg.shape.base_wo,
+      cfg.r, cfg.s, cfg.k,
+      cfg.params.pad_h, cfg.params.pad_w,
+      cfg.params.stride_h, cfg.params.stride_w,
+      cfg.params.dilation_h, cfg.params.dilation_w,
+      cfg.params.groups, cfg.shape.cin_group,
+      cfg.shape.kout_group,
+      cfg.params.ay, cfg.params.ax);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 void launch_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
                        const Conv2DRuntimeConfig& cfg) {
+  if (local_bprop_nhwc_enabled()) {
+    launch_bprop_nhwc_local(d_dy, d_w, d_dx, cfg);
+    return;
+  }
+
   const int n = cfg.n;
   const int h = cfg.h;
   const int w = cfg.w;
@@ -2590,9 +2911,41 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
   launch_grad_nhwc(d_x, d_dy, d_dw, make_conv2d_runtime_config(n, h, w, c, w_shape, p), algo);
 }
 
+void launch_grad_nhwc_local(const float* d_x, const float* d_dy, float* d_dw,
+                            int n, int h, int w, int c, int r, int s, int k,
+                            const Conv2DParams& p) {
+  const FilterKRSC w_shape(r, s, c / p.groups, k, p.ay, p.ax);
+  launch_grad_nhwc_local(d_x, d_dy, d_dw, make_conv2d_runtime_config(n, h, w, c, w_shape, p));
+}
+
+void launch_grad_nhwc_local(const float* d_x, const float* d_dy, float* d_dw,
+                            const Conv2DRuntimeConfig& cfg) {
+  const int total_weights =
+      cfg.params.groups * cfg.r * cfg.s * cfg.shape.cin_group *
+      cfg.shape.kout_group * cfg.params.ay * cfg.params.ax;
+  const size_t shared_size = kLocalGradBlockSize * sizeof(float);
+  local_grad_nhwc_kernel<<<total_weights, kLocalGradBlockSize, shared_size>>>(
+      d_x, d_dy, d_dw,
+      cfg.n, cfg.h, cfg.w, cfg.c,
+      cfg.shape.base_ho, cfg.shape.base_wo,
+      cfg.r, cfg.s, cfg.k,
+      cfg.params.pad_h, cfg.params.pad_w,
+      cfg.params.stride_h, cfg.params.stride_w,
+      cfg.params.dilation_h, cfg.params.dilation_w,
+      cfg.params.groups, cfg.shape.cin_group,
+      cfg.shape.kout_group,
+      cfg.params.ay, cfg.params.ax);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                       const Conv2DRuntimeConfig& cfg,
                       GradKernelAlgo algo) {
+  if (local_grad_nhwc_enabled()) {
+    launch_grad_nhwc_local(d_x, d_dy, d_dw, cfg);
+    return;
+  }
+
   const int n = cfg.n;
   const int h = cfg.h;
   const int w = cfg.w;

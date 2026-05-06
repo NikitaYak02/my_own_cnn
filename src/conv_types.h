@@ -509,11 +509,21 @@ void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
                        const Conv2DParams& p);
 void launch_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
                        const Conv2DRuntimeConfig& cfg);
+void launch_fprop_nhwc_local(const float* d_x, const float* d_w, float* d_y,
+                             int n, int h, int w, int c, int r, int s, int k,
+                             const Conv2DParams& p);
+void launch_fprop_nhwc_local(const float* d_x, const float* d_w, float* d_y,
+                             const Conv2DRuntimeConfig& cfg);
 void launch_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
                        int n, int h, int w, int c, int r, int s, int k,
                        const Conv2DParams& p);
 void launch_bprop_nhwc(const float* d_dy, const float* d_w, float* d_dx,
                        const Conv2DRuntimeConfig& cfg);
+void launch_bprop_nhwc_local(const float* d_dy, const float* d_w, float* d_dx,
+                             int n, int h, int w, int c, int r, int s, int k,
+                             const Conv2DParams& p);
+void launch_bprop_nhwc_local(const float* d_dy, const float* d_w, float* d_dx,
+                             const Conv2DRuntimeConfig& cfg);
 void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                       int n, int h, int w, int c, int r, int s, int k,
                       const Conv2DParams& p,
@@ -521,6 +531,11 @@ void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
 void launch_grad_nhwc(const float* d_x, const float* d_dy, float* d_dw,
                       const Conv2DRuntimeConfig& cfg,
                       GradKernelAlgo algo = GradKernelAlgo::GemmIm2Col);
+void launch_grad_nhwc_local(const float* d_x, const float* d_dy, float* d_dw,
+                            int n, int h, int w, int c, int r, int s, int k,
+                            const Conv2DParams& p);
+void launch_grad_nhwc_local(const float* d_x, const float* d_dy, float* d_dw,
+                            const Conv2DRuntimeConfig& cfg);
 void launch_block_fprop_nhwc(const float* d_x, const float* d_w, float* d_y,
                              int n, int h, int w, int c, int r, int s, int k,
                              const BlockConv2DParams& p);
